@@ -1,0 +1,9 @@
+{
+  "name": "mici-ui-mcp",
+  "description": "Drive the openpilot UI locally (MCP server). Launches the UI on a private headless display, screenshots it, and injects touch (tap, swipe, long-press) to build and validate UI changes without a device. Optionally replays a route so the onroad UI shows real driving data.",
+  "author": {
+    "name": "elkoled"
+  },
+  "repository": "https://github.com/elkoled/skills",
+  "license": "MIT"
+}

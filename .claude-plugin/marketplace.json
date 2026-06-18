@@ -8,6 +8,11 @@
       "name": "logreader-mcp",
       "source": "./plugins/logreader-mcp",
       "description": "openpilot route analysis + panda safety debugger as an MCP server: read cereal and CAN, decode DBC signals, events and engagement, anomaly scan, and find the exact safety source line that blocks each panda TX."
+    },
+    {
+      "name": "mici-ui-mcp",
+      "source": "./plugins/mici-ui-mcp",
+      "description": "Drive the openpilot UI locally as an MCP server: launch the UI on a private headless display, screenshot it, and inject touch (tap, swipe, long-press) to build and validate UI changes without a device. Optionally replay a route for the onroad UI."
     }
   ]
 }

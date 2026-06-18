@@ -1,0 +1,5 @@
+{
+  "mici-ui-mcp": {
+    "command": "${CLAUDE_PLUGIN_ROOT}/run.sh"
+  }
+}
