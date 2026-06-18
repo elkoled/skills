@@ -1,0 +1,9 @@
+{
+  "name": "logreader-mcp",
+  "description": "openpilot route analysis + panda safety debugger (MCP server). Reads cereal and CAN from a route, decodes DBC signals, summarizes events/engagement, runs an anomaly scan, and pins the exact safety source line that blocks each panda TX message.",
+  "author": {
+    "name": "elkoled"
+  },
+  "repository": "https://github.com/elkoled/skills",
+  "license": "MIT"
+}

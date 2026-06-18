@@ -1,0 +1,5 @@
+{
+  "logreader": {
+    "command": "${CLAUDE_PLUGIN_ROOT}/run.sh"
+  }
+}

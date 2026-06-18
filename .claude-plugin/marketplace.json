@@ -1,0 +1,13 @@
+{
+  "name": "elkoled-skills",
+  "owner": {
+    "name": "elkoled"
+  },
+  "plugins": [
+    {
+      "name": "logreader-mcp",
+      "source": "./plugins/logreader-mcp",
+      "description": "openpilot route analysis + panda safety debugger as an MCP server: read cereal and CAN, decode DBC signals, events and engagement, anomaly scan, and find the exact safety source line that blocks each panda TX."
+    }
+  ]
+}
