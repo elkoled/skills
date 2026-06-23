@@ -23,7 +23,10 @@ screenshot in the tool result, so you see the effect of each action immediately.
 - A built openpilot checkout (`uv run scons -j$(nproc)` builds `msgq`, `cereal` and
   `tools/replay/replay`). Without the build the UI will not import its native modules.
 - `Xvfb` on PATH (`apt install xvfb`). Capture and touch need no other system tools.
-- The server runs against `$OPENPILOT_ROOT` (defaults to `~/openpilot`).
+- The server runs against `$OPENPILOT_ROOT` (defaults to `~/openpilot`), or pass `root=`
+  to `start_ui` to switch checkout at runtime. It detects both the flat layout and the
+  nested one (source under `openpilot/`), and `status` reports the resolved
+  `openpilot_root` and `pkg_prefix`.
 
 ## Workflow
 
@@ -51,9 +54,12 @@ scaled 1:1, so a point in the screenshot is the point you pass.
   that panel; on the top level it moves between screens.
 - If a tool reports the UI is not running or did not render, call `logs` to see the UI
   stdout/stderr (a missing `scons` build or a missing `Xvfb` are the usual causes).
+- `restart_ui` reloads Python only. A change to C++, Cython or a param key (like a new key
+  in `common/params_keys.h`) needs a `scons` rebuild from the repo root first, or the UI
+  imports a stale module and `Params().put_bool(<newkey>)` raises `UnknownKeyName`.
 
 ## Tools
 
 `start_ui`, `restart_ui`, `stop_ui`, `status`, `screenshot`, `tap`, `swipe`, `hold`,
-`run`, `set_param`, `start_replay`, `stop_replay`, `logs`. Each tool documents its own
-arguments; read the tool descriptions for details.
+`run`, `set_param`, `publish`, `start_replay`, `stop_replay`, `logs`. Each tool documents
+its own arguments; read the tool descriptions for details.

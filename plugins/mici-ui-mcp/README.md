@@ -26,14 +26,17 @@ This plugin is published in the `elkoled-skills` marketplace:
 
 `run.sh` launches the server inside the openpilot venv via
 `uv run --project "$OPENPILOT_ROOT" --with "mcp,pillow,python-xlib"`, so the MCP
-dependencies are pulled in on first run. `OPENPILOT_ROOT` defaults to `~/openpilot`; set
-it in the environment if your checkout lives elsewhere.
+dependencies are pulled in on first run. `OPENPILOT_ROOT` defaults to `~/openpilot`. Set
+it in the environment if your checkout lives elsewhere, or pass `root=` to `start_ui` to
+switch checkout at runtime. Both the flat layout and the nested one (source under
+`openpilot/`) are detected automatically, and `status` reports the resolved
+`openpilot_root` and `pkg_prefix`.
 
 ## Tools
 
 | tool | what it does |
 |------|--------------|
-| `start_ui(mode, show_touches, show_fps)` | launch the UI; `mode` = `small` (536x240) or `big` (2160x1080). Returns a screenshot. |
+| `start_ui(mode, show_touches, show_fps, root?)` | launch the UI (`mode` = `small` 536x240 or `big` 2160x1080), optionally pointing at another checkout via `root`. Returns a screenshot. |
 | `restart_ui(mode?)` | stop and relaunch to pick up code changes |
 | `stop_ui()` | tear down UI, replay and the display |
 | `screenshot()` | capture the current screen as a PNG |
@@ -41,7 +44,8 @@ it in the environment if your checkout lives elsewhere.
 | `swipe(x1, y1, x2, y2, dur?)` | stepped swipe (scrolls, not jumps) |
 | `hold(x, y, dur?)` | long-press |
 | `run(script)` | run a multi-step touch chain in one call |
-| `set_param(name, value, restart?)` | write an openpilot Param (e.g. `ShowDebugInfo=1`) |
+| `set_param(name, value, restart?)` | write an openpilot Param like `ShowDebugInfo=true`. value type matches the param (bool/int/float/str) |
+| `publish(service, fields, hz?, secs?)` | publish a cereal message (fields by dotted path) so the UI sees data not in a recorded route |
 | `start_replay(route, dcam?, ecam?)` | replay a route (empty = demo route) into the running UI |
 | `stop_replay()` | stop replay |
 | `status()` / `logs(lines?)` | session state / tail the UI log |
@@ -76,4 +80,6 @@ tap 268 120; wait 0.6; capture settings; tap 150 120; wait 0.6; capture toggles
 - `show_touches=True` (default) draws a red dot and trail where touches land.
 - If `start_ui` reports `rendered: false`, call `logs`. The UI likely failed to import a
   compiled module (rebuild with `scons`) or `Xvfb` is missing.
-- One UI runs at a time per server process; it is killed on server exit.
+- `restart_ui` reloads Python only. A change to C++, Cython or a param key (like a new key
+  in `common/params_keys.h`) needs a `scons` rebuild from the repo root first.
+- One UI runs at a time per server process, and is killed on server exit.

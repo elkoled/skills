@@ -16,7 +16,9 @@ pays startup cost.
 from __future__ import annotations
 
 import io
+import json
 import os
+import re
 import signal
 import subprocess
 import time
@@ -38,18 +40,34 @@ UI_SETTLE = 0.4
 SWIPE_STEPS = 24
 
 
+# nested layout keeps SConstruct at root but moves the source under openpilot/
+# return the prefix to build paths from, or None if this is not a checkout
+def _pkg_prefix(root: Path) -> str | None:
+  for prefix in ("", "openpilot"):
+    if (root / prefix / "selfdrive" / "ui" / "ui.py").exists():
+      return prefix
+  return None
+
+
 def _find_openpilot_root() -> Path:
   env = os.getenv("OPENPILOT_ROOT")
   if env:
     return Path(env).expanduser().resolve()
   here = Path(__file__).resolve()
   for p in [here, *here.parents]:
-    if (p / "SConstruct").exists() and (p / "selfdrive" / "ui" / "ui.py").exists():
+    if (p / "SConstruct").exists() and _pkg_prefix(p) is not None:
       return p
   return Path.home() / "openpilot"
 
 
 OPENPILOT_ROOT = _find_openpilot_root()
+
+# replay's TUI fills logs with escape codes. strip CSI seqs and stray controls
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[()#][0-9A-Za-z]|[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _strip_ansi(s: str) -> str:
+  return _ANSI.sub("", s)
 
 
 class UISessionError(RuntimeError):
@@ -59,6 +77,7 @@ class UISessionError(RuntimeError):
 class UISession:
   def __init__(self, root: Path):
     self.root = root
+    self.pkg_prefix = _pkg_prefix(root) or ""
     self.mode = "small"
     self.width = 0
     self.height = 0
@@ -74,6 +93,32 @@ class UISession:
 
   def is_running(self) -> bool:
     return self._ui is not None and self._ui.poll() is None
+
+  def set_root(self, root: str) -> None:
+    p = Path(root).expanduser().resolve()
+    if p == self.root:
+      return
+    if not (p / "SConstruct").exists():
+      raise UISessionError(f"not an openpilot checkout: {p}")
+    prefix = _pkg_prefix(p)
+    if prefix is None:
+      raise UISessionError(f"no selfdrive/ui/ui.py under {p}")
+    if self.is_running():
+      raise UISessionError("stop the UI before changing root")
+    self.root = p
+    self.pkg_prefix = prefix
+
+  # path under the checkout, prefixed for the nested layout
+  def _rel(self, *parts: str) -> str:
+    return str(Path(self.pkg_prefix, *parts))
+
+  # nested layout imports openpilot.* so the repo root must be on PYTHONPATH
+  def _env(self) -> dict:
+    env = dict(os.environ)
+    if self.pkg_prefix:
+      existing = env.get("PYTHONPATH")
+      env["PYTHONPATH"] = str(self.root) + (os.pathsep + existing if existing else "")
+    return env
 
   def _free_display(self, start: int = 99) -> int:
     for n in range(start, start + 64):
@@ -122,7 +167,7 @@ class UISession:
       self._disp = display.Display(self.display_name)
       self._root_win = self._disp.screen().root
 
-      env = dict(os.environ)
+      env = self._env()
       env.update({
         "DISPLAY": self.display_name,
         "SCALE": "1.0",
@@ -137,7 +182,7 @@ class UISession:
       self.ui_log = f"/tmp/op_ui_mcp_ui{self.display_num}.log"
       with open(self.ui_log, "w") as ui_log_f:
         self._ui = subprocess.Popen(
-          ["uv", "run", "selfdrive/ui/ui.py"],
+          ["uv", "run", self._rel("selfdrive", "ui", "ui.py")],
           cwd=str(self.root), env=env,
           stdout=ui_log_f, stderr=subprocess.STDOUT,
           start_new_session=True,
@@ -206,6 +251,7 @@ class UISession:
       "resolution": f"{self.width}x{self.height}" if self.width else None,
       "display": self.display_name or None,
       "openpilot_root": str(self.root),
+      "pkg_prefix": self.pkg_prefix or None,
       "replay_running": self._replay is not None and self._replay.poll() is None,
       "ui_log": self.ui_log or None,
     }
@@ -298,23 +344,65 @@ class UISession:
         raise UISessionError(f"[{i}] unknown step: {op!r}")
     return log, shots
 
-  def set_param(self, name: str, value: str) -> str:
+  def set_param(self, name: str, value: bool | int | float | str) -> str:
+    # put routes by the value's python type with no coercion, so pass it through as-is.
+    # str(v) would break INT/FLOAT params. a bool uses put_bool to be explicit.
+    # json carries the value so nan/inf survive, repr would emit bare NameError tokens
     code = (
+      "import json;"
       "from openpilot.common.params import Params;"
-      f"Params().put({name!r}, {value!r});"
+      f"v = json.loads({json.dumps(value)!r});"
+      "p = Params();"
+      f"p.put_bool({name!r}, v) if isinstance(v, bool) else p.put({name!r}, v);"
       f"print('set', {name!r})"
     )
     res = subprocess.run(["uv", "run", "python3", "-c", code], cwd=str(self.root),
-                         capture_output=True, text=True, timeout=120)
+                         env=self._env(), capture_output=True, text=True, timeout=120)
     if res.returncode != 0:
       raise UISessionError(f"set_param failed: {res.stderr.strip() or res.stdout.strip()}")
+    return res.stdout.strip()
+
+  def publish(self, service: str, fields: dict, hz: float = 0.0, secs: float = 0.0) -> str:
+    # run in the checkout's env so it uses that cereal schema. fields set by dotted path.
+    # nested layout puts cereal under the openpilot package, flat keeps it top-level
+    cereal_pkg = f"{self.pkg_prefix}.cereal" if self.pkg_prefix else "cereal"
+    code = (
+      "import time, json\n"
+      f"from {cereal_pkg} import messaging\n"
+      f"service = {service!r}\n"
+      f"fields = json.loads({json.dumps(fields)!r})\n"
+      f"hz, secs = {hz!r}, {secs!r}\n"
+      "pm = messaging.PubMaster([service])\n"
+      "msg = messaging.new_message(service)\n"
+      "for path, val in fields.items():\n"
+      "  obj = getattr(msg, service)\n"
+      "  parts = path.split('.')\n"
+      "  for p in parts[:-1]:\n"
+      "    obj = getattr(obj, p)\n"
+      "  setattr(obj, parts[-1], val)\n"
+      "if hz > 0 and secs > 0:\n"
+      "  end = time.monotonic() + secs\n"
+      "  n = 0\n"
+      "  while time.monotonic() < end:\n"
+      "    pm.send(service, msg)\n"
+      "    n += 1\n"
+      "    time.sleep(1.0 / hz)\n"
+      "  print('published', service, n, 'times')\n"
+      "else:\n"
+      "  pm.send(service, msg)\n"
+      "  print('published', service, 'once')\n"
+    )
+    res = subprocess.run(["uv", "run", "python3", "-c", code], cwd=str(self.root),
+                         env=self._env(), capture_output=True, text=True, timeout=max(120.0, secs + 30))
+    if res.returncode != 0:
+      raise UISessionError(f"publish failed: {res.stderr.strip() or res.stdout.strip()}")
     return res.stdout.strip()
 
   def start_replay(self, route: str = "", extra_args: list[str] | None = None) -> dict:
     if not self.is_running():
       raise UISessionError("start the UI before replay so they share the same msgq")
     self.stop_replay(quiet=True)
-    args = ["tools/replay/replay"]
+    args = [self._rel("tools", "replay", "replay")]
     if route:
       args.append(route)
     else:
@@ -322,7 +410,7 @@ class UISession:
     if extra_args:
       args += list(extra_args)
     self.replay_log = f"/tmp/op_ui_mcp_replay{self.display_num}.log"
-    env = dict(os.environ)
+    env = self._env()
     env["DISPLAY"] = self.display_name
     with open(self.replay_log, "w") as log_f:
       self._replay = subprocess.Popen(args, cwd=str(self.root), env=env,
@@ -350,7 +438,7 @@ class UISession:
     if not self.ui_log or not os.path.exists(self.ui_log):
       return "(no UI log yet)"
     with open(self.ui_log) as f:
-      return "".join(f.readlines()[-lines:])
+      return _strip_ansi("".join(f.readlines()[-lines:]))
 
 
 SESSION = UISession(OPENPILOT_ROOT)
@@ -377,13 +465,17 @@ mcp = FastMCP(
 
 
 @mcp.tool()
-def start_ui(mode: str = "small", show_touches: bool = True, show_fps: bool = False) -> list:
+def start_ui(mode: str = "small", show_touches: bool = True, show_fps: bool = False,
+             root: str | None = None) -> list:
   """Launch the openpilot UI on a private headless display and return a screenshot.
 
   mode: 'small' (536x240, comma four/mici layout) or 'big' (2160x1080, tici layout).
   show_touches: draw a red dot + trail at injected touches (great for confirming taps).
+  root: point at a different checkout for this and later calls (defaults to $OPENPILOT_ROOT).
   Idempotent-ish: errors if a UI is already running (use restart_ui to reload code).
   """
+  if root:
+    SESSION.set_root(root)
   status = SESSION.start(mode=mode, show_touches=show_touches, show_fps=show_fps)
   out: list = [f"started: {status}"]
   if SESSION.is_running():
@@ -476,9 +568,11 @@ def run(script: str) -> list:
 
 
 @mcp.tool()
-def set_param(name: str, value: str, restart: bool = False) -> str:
-  """Write an openpilot Param (e.g. ShowDebugInfo=1 for the touch/widget overlay).
+def set_param(name: str, value: bool | int | float | str, restart: bool = False) -> str:
+  """Write an openpilot Param (e.g. ShowDebugInfo=true for the touch/widget overlay).
 
+  value type must match the param type (no coercion): bool for BOOL, int for INT,
+  float for FLOAT, str for STRING (so pass true/false for a BOOL param, not 1/0).
   Params are read at UI start, so pass restart=True to relaunch the UI afterwards.
   """
   msg = SESSION.set_param(name, value)
@@ -487,6 +581,20 @@ def set_param(name: str, value: str, restart: bool = False) -> str:
     SESSION.start(mode=SESSION.mode)
     msg += " (UI restarted)"
   return msg
+
+
+@mcp.tool()
+def publish(service: str, fields: dict, hz: float = 0.0, secs: float = 0.0) -> str:
+  """Publish a cereal message so the UI sees data not in any recorded route.
+
+  fields are keyed by dotted path under the message, e.g.
+  publish('selfdriveState', {'alertText1': 'hi', 'alertStatus': 'userPrompt'}) or
+  publish('carState', {'vEgo': 12.5, 'cruiseState.enabled': True}). Enums take their str
+  name, numbers take plain ints/floats. Struct-root services only (not list-root ones like
+  'can'). hz>0 with secs>0 repeats the send (blocking) so a SubMaster stays fresh; keep
+  secs small or background your own publisher.
+  """
+  return SESSION.publish(service, fields, hz, secs)
 
 
 @mcp.tool()
