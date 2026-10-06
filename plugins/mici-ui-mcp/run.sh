@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export OPENPILOT_ROOT="${OPENPILOT_ROOT:-$HOME/openpilot}"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec uv run --project "$OPENPILOT_ROOT" --with "mcp,pillow,python-xlib" python "$DIR/run_server.py"
+# own small env, independent of the openpilot venv. uv caches it so later starts are instant
+exec uv run --quiet --no-project --with "mcp>=2.3,<3" --with pillow --with python-xlib python "$DIR/run_server.py"

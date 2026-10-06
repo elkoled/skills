@@ -14,7 +14,7 @@ description: >-
 # mici-ui-mcp - drive the openpilot UI on a PC
 
 This plugin ships an MCP server (`mici-ui-mcp`) that runs the real UI
-(`uv run selfdrive/ui/ui.py`) on a private headless Xvfb display, captures the screen,
+(`selfdrive/ui/ui.py` with the checkout's `.venv` python) on a private headless Xvfb display, captures the screen,
 and injects touch. Prefer these MCP tools over launching the UI by hand: they return a
 screenshot in the tool result, so you see the effect of each action immediately.
 
@@ -23,7 +23,8 @@ screenshot in the tool result, so you see the effect of each action immediately.
 - A built openpilot checkout (`uv run scons -j$(nproc)` builds `msgq`, `cereal` and
   `tools/replay/replay`). Without the build the UI will not import its native modules.
 - `Xvfb` on PATH (`apt install xvfb`). Capture and touch need no other system tools.
-- The server runs against `$OPENPILOT_ROOT` (defaults to `~/openpilot`), or pass `root=`
+- The server runs against `$OPENPILOT_ROOT`, else the checkout the session started in,
+  else `~/openpilot`. Or pass `root=`
   to `start_ui` to switch checkout at runtime. It detects both the flat layout and the
   nested one (source under `openpilot/`), and `status` reports the resolved
   `openpilot_root` and `pkg_prefix`.
@@ -48,8 +49,11 @@ scaled 1:1, so a point in the screenshot is the point you pass.
 ## Behavior to know
 
 - The home screen is one big button: tapping almost anywhere opens Settings.
-- `show_touches` (on by default) draws a red dot and trail where touches land. Use it to
-  confirm a tap hit its target.
+- `show_touches=True` draws a red dot and trail where touches land, plus red debug outlines
+  on every widget. Off by default so screenshots show the real UI. Turn it on to confirm a
+  tap hit its target.
+- Touch tools return once the screen stops changing (capped at 0.5s), so no `wait` is
+  needed before a screenshot or `capture`.
 - A horizontal swipe drives whichever scroller is in focus. Inside a panel it scrolls
   that panel; on the top level it moves between screens.
 - If a tool reports the UI is not running or did not render, call `logs` to see the UI
@@ -57,9 +61,16 @@ scaled 1:1, so a point in the screenshot is the point you pass.
 - `restart_ui` reloads Python only. A change to C++, Cython or a param key (like a new key
   in `common/params_keys.h`) needs a `scons` rebuild from the repo root first, or the UI
   imports a stale module and `Params().put_bool(<newkey>)` raises `UnknownKeyName`.
+- `stop_replay` leaves the UI frozen on the last onroad frame, so settings stays
+  unreachable. Call `go_offroad` to land on the home page. A published alert is sticky
+  (it stays after the publisher stops), so `clear_alerts` to remove it.
+- To catch a transient onroad state (a forced alert, a set-speed flash), use
+  `publish(..., background=True)` and `screenshot` while it keeps sending, then
+  `stop_publish`. Reaching a specific settings panel is still manual swiping.
 
 ## Tools
 
 `start_ui`, `restart_ui`, `stop_ui`, `status`, `screenshot`, `tap`, `swipe`, `hold`,
-`run`, `set_param`, `publish`, `start_replay`, `stop_replay`, `logs`. Each tool documents
-its own arguments; read the tool descriptions for details.
+`run`, `set_param`, `publish`, `stop_publish`, `go_offroad`, `clear_alerts`,
+`start_replay`, `stop_replay`, `logs`. Each tool documents its own arguments; read the
+tool descriptions for details.

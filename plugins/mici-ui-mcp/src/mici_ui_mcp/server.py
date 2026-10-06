@@ -28,7 +28,8 @@ from PIL import Image as PILImage
 from Xlib import X, display
 from Xlib.ext import xtest
 
-from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.mcpserver import Image, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 SIZES = {
   "small": (536, 240),
@@ -36,7 +37,11 @@ SIZES = {
 }
 
 UI_READY_TIMEOUT = 40.0
-UI_SETTLE = 0.4
+# after an input, poll until the screen holds still instead of sleeping a fixed time.
+# a moving camera (replay) never holds still, so that case ends at SETTLE_MAX
+SETTLE_MIN = 0.08
+SETTLE_STABLE = 0.1
+SETTLE_MAX = 0.5
 SWIPE_STEPS = 24
 
 
@@ -49,15 +54,25 @@ def _pkg_prefix(root: Path) -> str | None:
   return None
 
 
+def _is_checkout(p: Path) -> bool:
+  return (p / "SConstruct").exists() and _pkg_prefix(p) is not None
+
+
+# $OPENPILOT_ROOT, else the checkout the client was started in, else ~/openpilot
 def _find_openpilot_root() -> Path:
   env = os.getenv("OPENPILOT_ROOT")
   if env:
     return Path(env).expanduser().resolve()
-  here = Path(__file__).resolve()
-  for p in [here, *here.parents]:
-    if (p / "SConstruct").exists() and _pkg_prefix(p) is not None:
-      return p
+  for start in (Path.cwd().resolve(), Path(__file__).resolve()):
+    for p in [start, *start.parents]:
+      if _is_checkout(p):
+        return p
   return Path.home() / "openpilot"
+
+
+# msgq's cython extension only exists after scons, the UI can't import without it
+def _is_built(root: Path) -> bool:
+  return any(any((root / d).glob("ipc_pyx*.so")) for d in ("msgq_repo/msgq", "msgq"))
 
 
 OPENPILOT_ROOT = _find_openpilot_root()
@@ -70,7 +85,8 @@ def _strip_ansi(s: str) -> str:
   return _ANSI.sub("", s)
 
 
-class UISessionError(RuntimeError):
+# ToolError so the client sees the message, mcp 2 hides other exceptions
+class UISessionError(ToolError):
   pass
 
 
@@ -86,10 +102,12 @@ class UISession:
     self._xvfb: subprocess.Popen | None = None
     self._ui: subprocess.Popen | None = None
     self._replay: subprocess.Popen | None = None
+    self._publisher: subprocess.Popen | None = None
     self._disp: display.Display | None = None
     self._root_win = None
     self.ui_log = ""
     self.replay_log = ""
+    self.publish_log = ""
 
   def is_running(self) -> bool:
     return self._ui is not None and self._ui.poll() is None
@@ -120,6 +138,13 @@ class UISession:
       env["PYTHONPATH"] = str(self.root) + (os.pathsep + existing if existing else "")
     return env
 
+  # call the checkout's venv python directly, uv run would sync the venv on every launch
+  def _python(self) -> list[str]:
+    venv_python = self.root / ".venv" / "bin" / "python"
+    if venv_python.exists():
+      return [str(venv_python)]
+    return ["uv", "run", "--no-sync", "python3"]
+
   def _free_display(self, start: int = 99) -> int:
     for n in range(start, start + 64):
       if not os.path.exists(f"/tmp/.X{n}-lock") and not os.path.exists(f"/tmp/.X11-unix/X{n}"):
@@ -139,15 +164,19 @@ class UISession:
         return
       except Exception as e:  # noqa: BLE001
         last = e
-        time.sleep(0.2)
+        time.sleep(0.02)
     raise UISessionError(f"X server {name} did not come up: {last}")
 
-  def start(self, mode: str = "small", show_touches: bool = True,
+  def start(self, mode: str = "small", show_touches: bool = False,
             show_fps: bool = False, extra_env: dict | None = None) -> dict:
     if mode not in SIZES:
       raise UISessionError(f"unknown mode {mode!r}; use one of {list(SIZES)}")
     if self.is_running():
       raise UISessionError("UI already running; call stop_ui first or use restart_ui")
+    if not _is_checkout(self.root):
+      raise UISessionError(f"{self.root} is not an openpilot checkout; pass root= or set OPENPILOT_ROOT")
+    if not _is_built(self.root):
+      raise UISessionError(f"{self.root} is not built (no msgq ipc_pyx); run `scons -j$(nproc)` there or pass root=")
     self.stop(quiet=True)
 
     self.mode = mode
@@ -182,7 +211,7 @@ class UISession:
       self.ui_log = f"/tmp/op_ui_mcp_ui{self.display_num}.log"
       with open(self.ui_log, "w") as ui_log_f:
         self._ui = subprocess.Popen(
-          ["uv", "run", self._rel("selfdrive", "ui", "ui.py")],
+          [*self._python(), self._rel("selfdrive", "ui", "ui.py")],
           cwd=str(self.root), env=env,
           stdout=ui_log_f, stderr=subprocess.STDOUT,
           start_new_session=True,
@@ -207,15 +236,16 @@ class UISession:
         img = self._grab()
         bbox = img.convert("L").point(lambda v: 255 if v > 40 else 0).getbbox()
         if bbox is not None:
-          time.sleep(UI_SETTLE)
+          self.settle()
           return True
       except Exception:  # noqa: BLE001
         pass
-      time.sleep(0.4)
+      time.sleep(0.05)
     return False
 
   def stop(self, quiet: bool = False) -> dict:
     self.stop_replay(quiet=True)
+    self.stop_publish(quiet=True)
     for attr in ("_ui", "_xvfb"):
       proc = getattr(self, attr)
       if proc is not None and proc.poll() is None:
@@ -253,6 +283,7 @@ class UISession:
       "openpilot_root": str(self.root),
       "pkg_prefix": self.pkg_prefix or None,
       "replay_running": self._replay is not None and self._replay.poll() is None,
+      "publish_running": self._publisher is not None and self._publisher.poll() is None,
       "ui_log": self.ui_log or None,
     }
 
@@ -263,10 +294,30 @@ class UISession:
     raw = self._root_win.get_image(0, 0, geo.width, geo.height, X.ZPixmap, 0xffffffff)
     return PILImage.frombytes("RGB", (geo.width, geo.height), raw.data, "raw", "BGRX")
 
+  # returns the settled frame so callers don't grab again
+  def settle(self) -> PILImage.Image:
+    start = time.monotonic()
+    img = self._grab()
+    last_change = start
+    while True:
+      time.sleep(1 / 60)
+      now = time.monotonic()
+      nxt = self._grab()
+      if nxt.tobytes() != img.tobytes():
+        last_change = now
+      img = nxt
+      if now - start >= SETTLE_MAX or (now - start >= SETTLE_MIN and now - last_change >= SETTLE_STABLE):
+        return img
+
   def screenshot(self) -> PILImage.Image:
     if not self.is_running():
       raise UISessionError("UI is not running; call start_ui first")
     return self._grab()
+
+  def settled_screenshot(self) -> PILImage.Image:
+    if not self.is_running():
+      raise UISessionError("UI is not running; call start_ui first")
+    return self.settle()
 
   def _clamp(self, x: int, y: int) -> tuple[int, int]:
     return max(0, min(self.width - 1, int(x))), max(0, min(self.height - 1, int(y)))
@@ -338,7 +389,7 @@ class UISession:
         log.append(f"[{i}] wait {args[0]}")
       elif op == "capture":
         name = args[0] if args else str(i)
-        shots.append((name, self._grab()))
+        shots.append((name, self.settle()))
         log.append(f"[{i}] capture -> {name}")
       else:
         raise UISessionError(f"[{i}] unknown step: {op!r}")
@@ -356,18 +407,27 @@ class UISession:
       f"p.put_bool({name!r}, v) if isinstance(v, bool) else p.put({name!r}, v);"
       f"print('set', {name!r})"
     )
-    res = subprocess.run(["uv", "run", "python3", "-c", code], cwd=str(self.root),
+    res = subprocess.run([*self._python(), "-c", code], cwd=str(self.root),
                          env=self._env(), capture_output=True, text=True, timeout=120)
     if res.returncode != 0:
       raise UISessionError(f"set_param failed: {res.stderr.strip() or res.stdout.strip()}")
     return res.stdout.strip()
 
-  def publish(self, service: str, fields: dict, hz: float = 0.0, secs: float = 0.0) -> str:
+  def publish(self, service: str, fields: dict, hz: float = 0.0, secs: float = 0.0,
+              background: bool = False) -> str:
     # run in the checkout's env so it uses that cereal schema. fields set by dotted path.
     # nested layout puts cereal under the openpilot package, flat keeps it top-level
+    if not self.is_running():
+      raise UISessionError("start the UI before publish so they share the same msgq")
+    if hz <= 0 and secs > 0:
+      raise UISessionError("secs needs hz > 0")
+    if background and hz <= 0:
+      raise UISessionError("background publish needs hz > 0")
+    if hz > 0 and secs <= 0 and not background:
+      raise UISessionError("a foreground repeat needs secs > 0; use background=True for indefinite")
     cereal_pkg = f"{self.pkg_prefix}.cereal" if self.pkg_prefix else "cereal"
     code = (
-      "import time, json\n"
+      "import sys, time, json\n"
       f"from {cereal_pkg} import messaging\n"
       f"service = {service!r}\n"
       f"fields = json.loads({json.dumps(fields)!r})\n"
@@ -380,23 +440,62 @@ class UISession:
       "  for p in parts[:-1]:\n"
       "    obj = getattr(obj, p)\n"
       "  setattr(obj, parts[-1], val)\n"
-      "if hz > 0 and secs > 0:\n"
-      "  end = time.monotonic() + secs\n"
-      "  n = 0\n"
-      "  while time.monotonic() < end:\n"
+      "pm.send(service, msg)\n"
+      "print('READY', file=sys.stderr, flush=True)\n"  # built and sent once, background waits on this
+      "if hz > 0:\n"
+      "  end = None if secs <= 0 else time.monotonic() + secs\n"
+      "  n = 1\n"
+      "  while end is None or time.monotonic() < end:\n"
+      "    time.sleep(1.0 / hz)\n"
       "    pm.send(service, msg)\n"
       "    n += 1\n"
-      "    time.sleep(1.0 / hz)\n"
       "  print('published', service, n, 'times')\n"
       "else:\n"
-      "  pm.send(service, msg)\n"
       "  print('published', service, 'once')\n"
     )
-    res = subprocess.run(["uv", "run", "python3", "-c", code], cwd=str(self.root),
-                         env=self._env(), capture_output=True, text=True, timeout=max(120.0, secs + 30))
+    cmd = [*self._python(), "-c", code]
+    if background:
+      # detach so the UI can be screenshotted mid-publish. a new background publish
+      # replaces any prior one. stop_publish or stop_ui ends it
+      self.stop_publish(quiet=True)
+      self.publish_log = f"/tmp/op_ui_mcp_publish{self.display_num}.log"
+      with open(self.publish_log, "w") as log_f:
+        self._publisher = subprocess.Popen(cmd, cwd=str(self.root), env=self._env(),
+                                            stdout=log_f, stderr=subprocess.STDOUT,
+                                            stdin=subprocess.DEVNULL, start_new_session=True)
+      # wait through uv/cereal cold start for the first send (READY) or an early crash
+      deadline = time.monotonic() + 15.0
+      while time.monotonic() < deadline:
+        rc = self._publisher.poll()
+        if rc is not None and rc != 0:
+          err = self._read_log(self.publish_log)
+          self._publisher = None
+          raise UISessionError(f"publish failed: {err}")
+        if rc == 0 or "READY" in self._read_log(self.publish_log):
+          break
+        time.sleep(0.1)
+      return f"publishing {service} in background (pid {self._publisher.pid}); stop with stop_publish"
+    res = subprocess.run(cmd, cwd=str(self.root), env=self._env(),
+                         capture_output=True, text=True, timeout=max(120.0, secs + 30))
     if res.returncode != 0:
       raise UISessionError(f"publish failed: {res.stderr.strip() or res.stdout.strip()}")
     return res.stdout.strip()
+
+  def stop_publish(self, quiet: bool = False) -> dict:
+    self._kill_proc("_publisher")
+    return {} if quiet else {"publish_stopped": True}
+
+  # ui_state.started = deviceState.started, so publishing it false drops the UI to the home page
+  def go_offroad(self) -> str:
+    return self.publish("deviceState", {"started": False}, hz=20, secs=0.5)
+
+  # a published alert sticks via _prev_alert until a none-size alert fades out, so stop any
+  # background publisher first (else it keeps re-sending the alert) then send the clear
+  def clear_alerts(self) -> str:
+    self.stop_publish(quiet=True)
+    return self.publish("selfdriveState",
+                        {"alertText1": "", "alertText2": "", "alertSize": "none", "alertStatus": "normal"},
+                        hz=25, secs=1.5)
 
   def start_replay(self, route: str = "", extra_args: list[str] | None = None) -> dict:
     if not self.is_running():
@@ -416,29 +515,38 @@ class UISession:
       self._replay = subprocess.Popen(args, cwd=str(self.root), env=env,
                                       stdout=log_f, stderr=subprocess.STDOUT,
                                       stdin=subprocess.DEVNULL, start_new_session=True)
-    time.sleep(1.0)
+    time.sleep(0.3)
     alive = self._replay.poll() is None
     return {"replay_started": alive, "args": args, "replay_log": self.replay_log}
 
   def stop_replay(self, quiet: bool = False) -> dict:
-    if self._replay is not None and self._replay.poll() is None:
-      try:
-        os.killpg(os.getpgid(self._replay.pid), signal.SIGTERM)
-        self._replay.wait(timeout=5)
-      except Exception:  # noqa: BLE001
-        try:
-          self._replay.kill()
-          self._replay.wait(timeout=5)
-        except Exception:  # noqa: BLE001
-          pass
-    self._replay = None
+    self._kill_proc("_replay")
     return {} if quiet else {"replay_stopped": True}
 
+  # SIGTERM the process group, escalate to kill, then drop the handle
+  def _kill_proc(self, attr: str) -> None:
+    proc = getattr(self, attr)
+    if proc is not None and proc.poll() is None:
+      try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        proc.wait(timeout=5)
+      except Exception:  # noqa: BLE001
+        try:
+          proc.kill()
+          proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+          pass
+    setattr(self, attr, None)
+
+  def _read_log(self, path: str, lines: int = 20) -> str:
+    try:
+      with open(path) as f:
+        return _strip_ansi("".join(f.readlines()[-lines:])).strip()
+    except OSError:
+      return ""
+
   def logs(self, lines: int = 40) -> str:
-    if not self.ui_log or not os.path.exists(self.ui_log):
-      return "(no UI log yet)"
-    with open(self.ui_log) as f:
-      return _strip_ansi("".join(f.readlines()[-lines:]))
+    return self._read_log(self.ui_log, lines) if self.ui_log else "(no UI log yet)"
 
 
 SESSION = UISession(OPENPILOT_ROOT)
@@ -450,7 +558,7 @@ def _img(pil: PILImage.Image) -> Image:
   return Image(data=buf.getvalue(), format="png")
 
 
-mcp = FastMCP(
+mcp = MCPServer(
   "mici-ui-mcp",
   instructions=(
     "Drive the openpilot UI locally to build and validate UI changes without a device.\n"
@@ -465,12 +573,12 @@ mcp = FastMCP(
 
 
 @mcp.tool()
-def start_ui(mode: str = "small", show_touches: bool = True, show_fps: bool = False,
+def start_ui(mode: str = "small", show_touches: bool = False, show_fps: bool = False,
              root: str | None = None) -> list:
   """Launch the openpilot UI on a private headless display and return a screenshot.
 
   mode: 'small' (536x240, comma four/mici layout) or 'big' (2160x1080, tici layout).
-  show_touches: draw a red dot + trail at injected touches (great for confirming taps).
+  show_touches: draw a red dot + trail at injected touches plus red debug outlines on every widget. off by default so screenshots show the real UI.
   root: point at a different checkout for this and later calls (defaults to $OPENPILOT_ROOT).
   Idempotent-ish: errors if a UI is already running (use restart_ui to reload code).
   """
@@ -484,7 +592,7 @@ def start_ui(mode: str = "small", show_touches: bool = True, show_fps: bool = Fa
 
 
 @mcp.tool()
-def restart_ui(mode: str | None = None, show_touches: bool = True, show_fps: bool = False) -> list:
+def restart_ui(mode: str | None = None, show_touches: bool = False, show_fps: bool = False) -> list:
   """Stop and relaunch the UI to pick up code changes. Keeps the same mode unless given."""
   m = mode or SESSION.mode
   SESSION.stop(quiet=True)
@@ -521,8 +629,7 @@ def tap(x: int, y: int, hold: float = 0.08) -> list:
   hold > 0.5s toggles Experimental Mode (only when longitudinal control is available).
   """
   SESSION.tap(x, y, hold)
-  time.sleep(0.5)
-  return [f"tapped ({x},{y}) hold={hold}", _img(SESSION.screenshot())]
+  return [f"tapped ({x},{y}) hold={hold}", _img(SESSION.settled_screenshot())]
 
 
 @mcp.tool()
@@ -533,16 +640,14 @@ def swipe(x1: int, y1: int, x2: int, y2: int, dur: float = 0.4) -> list:
   between screens/cards. Returns a fresh screenshot.
   """
   SESSION.swipe(x1, y1, x2, y2, dur)
-  time.sleep(0.5)
-  return [f"swiped ({x1},{y1})->({x2},{y2}) dur={dur}", _img(SESSION.screenshot())]
+  return [f"swiped ({x1},{y1})->({x2},{y2}) dur={dur}", _img(SESSION.settled_screenshot())]
 
 
 @mcp.tool()
 def hold(x: int, y: int, dur: float = 0.8) -> list:
   """Long-press at (x, y) for dur seconds (default 0.8). Returns a fresh screenshot."""
   SESSION.hold(x, y, dur)
-  time.sleep(0.5)
-  return [f"held ({x},{y}) dur={dur}", _img(SESSION.screenshot())]
+  return [f"held ({x},{y}) dur={dur}", _img(SESSION.settled_screenshot())]
 
 
 @mcp.tool()
@@ -554,7 +659,7 @@ def run(script: str) -> list:
     tap X Y [HOLD]            # tap; optional hold seconds (default 0.08)
     swipe X1 Y1 X2 Y2 [DUR]   # swipe over DUR seconds (default 0.4)
     hold X Y [DUR]            # long-press (default 0.8)
-    wait S                    # sleep S seconds (put one before a capture so the UI settles)
+    wait S                    # sleep S seconds (capture already waits for the UI to settle)
     capture [NAME]            # screenshot; NAME labels it (default = step index)
 
   Example: 'tap 268 120; wait 0.6; capture settings; tap 150 120; wait 0.6; capture toggles'
@@ -584,17 +689,54 @@ def set_param(name: str, value: bool | int | float | str, restart: bool = False)
 
 
 @mcp.tool()
-def publish(service: str, fields: dict, hz: float = 0.0, secs: float = 0.0) -> str:
+def publish(service: str, fields: dict, hz: float = 0.0, secs: float = 0.0,
+            background: bool = False) -> str:
   """Publish a cereal message so the UI sees data not in any recorded route.
 
   fields are keyed by dotted path under the message, e.g.
   publish('selfdriveState', {'alertText1': 'hi', 'alertStatus': 'userPrompt'}) or
   publish('carState', {'vEgo': 12.5, 'cruiseState.enabled': True}). Enums take their str
   name, numbers take plain ints/floats. Struct-root services only (not list-root ones like
-  'can'). hz>0 with secs>0 repeats the send (blocking) so a SubMaster stays fresh; keep
-  secs small or background your own publisher.
+  'can'). hz>0 with secs>0 repeats the send (blocking) so a SubMaster stays fresh.
+  background=True returns at once and keeps sending (until secs elapses, or forever if
+  secs=0), so you can screenshot mid-publish; call stop_publish to end it. One background
+  publisher at a time: a new background publish replaces the previous one.
   """
-  return SESSION.publish(service, fields, hz, secs)
+  return SESSION.publish(service, fields, hz, secs, background)
+
+
+@mcp.tool()
+def stop_publish() -> str:
+  """Stop a background publisher started with publish(background=True)."""
+  return str(SESSION.stop_publish())
+
+
+@mcp.tool()
+def go_offroad() -> list:
+  """Force the UI offroad to the home page (publishes deviceState.started=False).
+
+  After stop_replay the UI freezes on the last onroad frame and the scroller snaps back
+  to onroad, so settings can't be reached; call this to land on home. Returns a screenshot.
+  """
+  SESSION.go_offroad()
+  out: list = ["went offroad"]
+  if SESSION.is_running():
+    out.append(_img(SESSION.settled_screenshot()))
+  return out
+
+
+@mcp.tool()
+def clear_alerts() -> list:
+  """Clear a sticky onroad alert left on screen after a publish (fades out _prev_alert).
+
+  A published fullscreen alert stays up after the publisher stops because the demo route
+  never sends a clearing alert. Returns a screenshot.
+  """
+  SESSION.clear_alerts()
+  out: list = ["cleared alerts"]
+  if SESSION.is_running():
+    out.append(_img(SESSION.settled_screenshot()))
+  return out
 
 
 @mcp.tool()

@@ -2,7 +2,7 @@
 
 Drive the **openpilot UI locally** from an MCP client to build and validate UI changes
 fast, with no device, no network and no shared cursor. It runs the real UI
-(`uv run selfdrive/ui/ui.py`) on a private headless Xvfb display, lets the client see
+(`selfdrive/ui/ui.py` with the checkout's `.venv` python) on a private headless Xvfb display, lets the client see
 the screen (screenshots returned as images) and inject touch (tap, swipe, long-press),
 and can replay a route so the onroad UI shows real driving data.
 
@@ -24,11 +24,13 @@ This plugin is published in the `elkoled-skills` marketplace:
 - `uv` on PATH and `Xvfb` (`apt install xvfb`). Capture uses python-xlib (XGetImage) and
   touch uses XTEST, so no `xdotool`, `scrot` or `ffmpeg` is needed.
 
-`run.sh` launches the server inside the openpilot venv via
-`uv run --project "$OPENPILOT_ROOT" --with "mcp,pillow,python-xlib"`, so the MCP
-dependencies are pulled in on first run. `OPENPILOT_ROOT` defaults to `~/openpilot`. Set
-it in the environment if your checkout lives elsewhere, or pass `root=` to `start_ui` to
-switch checkout at runtime. Both the flat layout and the nested one (source under
+`run.sh` runs the server in its own small uv env (`mcp>=2.3,<3`, pillow, python-xlib),
+independent of the openpilot venv, so it never syncs or rebuilds the checkout and starts
+in about half a second once cached. The UI and helpers run with the checkout's
+`.venv/bin/python` directly. The checkout is `$OPENPILOT_ROOT` if set, else the openpilot
+checkout the client was started in, else `~/openpilot`. Pass `root=` to `start_ui` to
+switch checkout at runtime. `start_ui` fails fast with a clear message if the checkout is
+not built. Both the flat layout and the nested one (source under
 `openpilot/`) are detected automatically, and `status` reports the resolved
 `openpilot_root` and `pkg_prefix`.
 
@@ -45,7 +47,10 @@ switch checkout at runtime. Both the flat layout and the nested one (source unde
 | `hold(x, y, dur?)` | long-press |
 | `run(script)` | run a multi-step touch chain in one call |
 | `set_param(name, value, restart?)` | write an openpilot Param like `ShowDebugInfo=true`. value type matches the param (bool/int/float/str) |
-| `publish(service, fields, hz?, secs?)` | publish a cereal message (fields by dotted path) so the UI sees data not in a recorded route |
+| `publish(service, fields, hz?, secs?, background?)` | publish a cereal message (fields by dotted path) so the UI sees data not in a recorded route. `background=True` keeps sending so you can screenshot mid-publish |
+| `stop_publish()` | stop a background publisher |
+| `go_offroad()` | drop the UI to the home page (publishes `deviceState.started=False`) so settings is reachable after a replay |
+| `clear_alerts()` | clear a sticky onroad alert left on screen after a publish |
 | `start_replay(route, dcam?, ecam?)` | replay a route (empty = demo route) into the running UI |
 | `stop_replay()` | stop replay |
 | `status()` / `logs(lines?)` | session state / tail the UI log |
@@ -77,7 +82,8 @@ tap 268 120; wait 0.6; capture settings; tap 150 120; wait 0.6; capture toggles
 ## Notes
 
 - The home screen is one big button: tapping almost anywhere opens Settings.
-- `show_touches=True` (default) draws a red dot and trail where touches land.
+- `show_touches=True` draws a red dot and trail where touches land, plus red debug outlines
+  on every widget. Off by default so screenshots match the real UI.
 - If `start_ui` reports `rendered: false`, call `logs`. The UI likely failed to import a
   compiled module (rebuild with `scons`) or `Xvfb` is missing.
 - `restart_ui` reloads Python only. A change to C++, Cython or a param key (like a new key
