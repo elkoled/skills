@@ -56,6 +56,9 @@ ROUTE_CACHE_SCRIPT = Path(__file__).resolve().parent / "route_cache.py"
 
 CLIP_DIR = Path("/tmp/op_ui_mcp_clips")
 CLIP_RUNNER = Path(__file__).resolve().parent / "clip_runner.py"
+UI_DIFF_RUNNER = Path(__file__).resolve().parent / "ui_diff_runner.py"
+UI_DIFF_FPS = 60
+UI_DIFF_GAP = 30  # changed frames closer than this belong to one screen
 
 
 # a pip/venv ffmpeg on PATH can lack filters like pad, prefer the system build
@@ -663,7 +666,7 @@ class UISession:
     ui_dirs = [self._rel("selfdrive", "ui"), self._rel("system", "ui")]
     modules = []
     for path in self._git("diff", "--name-only", ref, "--", *ui_dirs).split():
-      if not path.endswith(".py") or path.endswith("__init__.py"):
+      if not path.endswith(".py") or path.endswith("__init__.py") or "/tests/" in path:
         continue
       res = subprocess.run(["git", "-C", str(self.root), "show", f"{ref}:{path}"], capture_output=True)
       if res.returncode != 0:  # new in the working tree, only new code imports it
@@ -749,6 +752,50 @@ class UISession:
     if warnings:
       result["warnings"] = warnings
     return result, out
+
+  # record openpilot's scripted UI tour with the ref's UI code and with the working tree, in
+  # parallel, then compare every frame. returns changed frame runs and the two videos
+  def ui_diff(self, ref: str, big: bool = False) -> dict:
+    replay = self.root / self._rel("selfdrive", "ui", "tests", "diff", "replay.py")
+    if not replay.exists():
+      raise UISessionError(f"no UI tour at {replay}")
+    if not _is_built(self.root):
+      raise UISessionError(f"{self.root} is not built (no msgq ipc_pyx); run `scons -j$(nproc)` there")
+    self.ensure_prefix()
+    CLIP_DIR.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="ui_diff_", dir=CLIP_DIR))
+    overlay_dir = work / "overlay"
+    overlay_dir.mkdir()
+    modules = self._ref_overlay(ref, overlay_dir)
+    variant = "tizi" if big else "mici"
+
+    t0 = time.monotonic()
+    procs = []
+    for label, overlay in ((ref, str(overlay_dir)), ("working tree", "")):
+      video = work / ("ref.mp4" if overlay else "new.mp4")
+      log = work / ("ref.log" if overlay else "new.log")
+      with open(log, "w") as log_f:
+        procs.append((label, video, log, subprocess.Popen([*self._python(), str(UI_DIFF_RUNNER), overlay, variant, str(video)],
+                                                          cwd=str(self.root), env=self._env(), stdout=log_f, stderr=subprocess.STDOUT,
+                                                          stdin=subprocess.DEVNULL, start_new_session=True)))
+    for label, video, log, proc in procs:
+      if proc.wait() != 0 or not video.exists():
+        raise UISessionError(f"UI tour for {label} failed:\n{self._read_log(str(log), 15)}")
+
+    ref_video, new_video = procs[0][1], procs[1][1]
+    h_ref, h_new = _frame_hashes(ref_video), _frame_hashes(new_video)
+    changed = [i for i, (a, b) in enumerate(zip(h_ref, h_new, strict=False)) if a != b]
+    runs: list[list[int]] = []
+    for i in changed:
+      if runs and i - runs[-1][1] <= UI_DIFF_GAP:
+        runs[-1][1] = i
+      else:
+        runs.append([i, i])
+    return {
+      "ref": ref, "variant": variant, "seconds": round(time.monotonic() - t0, 1),
+      "frames": [len(h_ref), len(h_new)], "changed_frames": len(changed), "ref_modules": modules,
+      "runs": runs, "ref_video": str(ref_video), "new_video": str(new_video), "work_dir": str(work),
+    }
 
   def logs(self, lines: int = 40) -> str:
     return self._read_log(self.ui_log, lines) if self.ui_log else "(no UI log yet)"
@@ -993,6 +1040,31 @@ def stop_replay() -> str:
   return str(SESSION.stop_replay())
 
 
+def _frame_hashes(video: Path) -> list[str]:
+  res = subprocess.run([_ff("ffmpeg"), "-nostdin", "-v", "error", "-i", str(video), "-map", "0:v:0", "-fps_mode", "passthrough",
+                        "-f", "framehash", "-hash", "md5", "-"], capture_output=True, text=True, check=False)
+  return [line.split(",")[-1].strip() for line in res.stdout.splitlines() if line and not line.startswith("#")]
+
+
+def _frame(video: Path, idx: int) -> PILImage.Image | None:
+  res = subprocess.run([_ff("ffmpeg"), "-nostdin", "-v", "error", "-i", str(video), "-vf", f"select=eq(n\\,{idx})", "-fps_mode", "passthrough",
+                        "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"], capture_output=True, check=False)
+  return PILImage.open(io.BytesIO(res.stdout)).convert("RGB") if res.returncode == 0 and res.stdout else None
+
+
+# ref | new | changed pixels in red over a dimmed new frame
+def _diff_panel(a: PILImage.Image, b: PILImage.Image) -> PILImage.Image:
+  from PIL import ImageChops
+  mask = ImageChops.difference(a, b).convert("L").point(lambda v: 255 if v > 8 else 0)
+  dim = PILImage.blend(b, PILImage.new("RGB", b.size), 0.6)
+  hl = PILImage.composite(PILImage.new("RGB", b.size, (255, 0, 0)), dim, mask)
+  gap = 4
+  out = PILImage.new("RGB", (a.width * 3 + gap * 2, a.height), (255, 255, 255))
+  for i, im in enumerate((a, b, hl)):
+    out.paste(im, (i * (a.width + gap), 0))
+  return out
+
+
 # middle frame of a clip as a quick look, so the caller doesn't need to open the video
 def _clip_preview(path: Path) -> Image | None:
   probe = subprocess.run([_ff("ffprobe"), "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
@@ -1027,6 +1099,37 @@ def render_clip(route: str = "", start: int | None = None, end: int | None = Non
   if preview is not None:
     content.append(preview)
   return content
+
+
+@mcp.tool()
+def ui_diff(ref: str = "master", big: bool = False, max_screens: int = 10) -> list:
+  """UI regression review in one call: record openpilot's scripted UI tour (home, settings panels,
+  keyboard, onroad, alerts; selfdrive/ui/tests/diff) with ref's UI code and with the working tree,
+  compare every frame, and return only the screens that changed.
+
+  Independent of start_ui. ref: git ref to compare against. big: tici layout instead of mici.
+  Each changed run of frames comes back as one image: ref | working tree | changed pixels in red.
+  Only python under selfdrive/ui and system/ui is swapped, the tour script itself always comes from
+  the working tree. Full videos of both tours are kept (paths in the result).
+  """
+  res = SESSION.ui_diff(ref, big)
+  runs = res["runs"]
+  summary = {k: v for k, v in res.items() if k != "runs"}
+  summary["changed_screens"] = [{"frames": f"{a}-{b}", "t": f"{a / UI_DIFF_FPS:.1f}s-{b / UI_DIFF_FPS:.1f}s"} for a, b in runs]
+  if res["frames"][0] != res["frames"][1]:
+    summary["note"] = "tours differ in length, frames after the first change in timing may all differ"
+  out: list = [str(summary) if runs else f"no pixel changes in {res['frames'][1]} frames: {summary}"]
+  ref_video, new_video = Path(res["ref_video"]), Path(res["new_video"])
+  for a, b in runs[:max_screens]:
+    mid = (a + b) // 2
+    fa, fb = _frame(ref_video, mid), _frame(new_video, mid)
+    if fa is None or fb is None:
+      continue
+    out.append(f"--- frames {a}-{b} ({a / UI_DIFF_FPS:.1f}s-{b / UI_DIFF_FPS:.1f}s), showing {mid} ---")
+    out.append(_img(_diff_panel(fa, fb)))
+  if len(runs) > max_screens:
+    out.append(f"{len(runs) - max_screens} more changed runs not shown, raise max_screens")
+  return out
 
 
 @mcp.tool()

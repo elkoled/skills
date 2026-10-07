@@ -59,6 +59,14 @@ render speed, on any checkout.
 tree below in one stacked mp4. Empty route is the demo route (90s-105s), pass `start`/`end`
 seconds for another range. Text overlays are off unless `overlays=True`.
 
+## UI regression review
+
+`ui_diff(ref="master")` answers "what did my change do to the UI" in one call (~10s). It records
+openpilot's scripted UI tour (home, settings panels, keyboard, onroad, alerts; frame-based clock,
+lossless) with the ref's UI python and with the working tree, compares every frame and returns
+one ref | new | changed-pixels image per run of changed frames. No `start_ui` needed. Only what
+the tour exercises is covered, onroad without model data or longitudinal car params.
+
 ## Coordinates
 
 Coordinates are the pixels you see in a screenshot: origin top-left, x to the right,
@@ -95,5 +103,5 @@ scaled 1:1, so a point in the screenshot is the point you pass.
 
 `start_ui`, `restart_ui`, `stop_ui`, `status`, `screenshot`, `tap`, `swipe`, `hold`,
 `run`, `set_param`, `publish`, `stop_publish`, `go_offroad`, `clear_alerts`,
-`start_replay`, `stop_replay`, `render_clip`, `logs`. Each tool documents its own arguments; read the
+`start_replay`, `stop_replay`, `render_clip`, `ui_diff`, `logs`. Each tool documents its own arguments; read the
 tool descriptions for details.

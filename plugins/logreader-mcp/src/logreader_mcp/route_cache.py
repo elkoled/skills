@@ -87,6 +87,9 @@ def _segment_can(identifier: str) -> dict[str, tuple]:
   return out
 
 
+HEADER_SERVICES = {"initData", "sentinel"}
+
+
 def _pool(n: int):
   return multiprocessing.get_context("fork").Pool(max(1, min(n, multiprocessing.cpu_count())))
 
@@ -243,9 +246,15 @@ class RouteData:
       _ = self.can
     return self._sendcan
 
+  # time span of the logged data. initData is repeated in every segment carrying the route's start
+  # time, so it would stretch a partial segment range back to the route start
+  def span(self) -> tuple[float, float]:
+    ts = [v["t"] for svc, v in self.index.items() if len(v["t"]) and svc not in HEADER_SERVICES]
+    return (float(min(t[0] for t in ts)), float(max(t[-1] for t in ts))) if ts else (0.0, 0.0)
+
   def duration_s(self) -> float:
-    ts = [v["t"] for v in self.index.values() if len(v["t"])]
-    return float(max(t[-1] for t in ts) - min(t[0] for t in ts)) if ts else 0.0
+    start, end = self.span()
+    return end - start
 
 
 _ROUTES: dict[str, RouteData] = {}

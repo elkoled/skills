@@ -22,6 +22,8 @@ works: comma-connect route names (using your `~/.comma/auth.json` token),
 | `changing_bits` | Which bits of a raw address toggle (reverse engineering) |
 | `events_timeline` / `engagement_summary` | Alerts timeline and engage/disengage transitions |
 | `health_scan` | One call: low rates, gaps, NaNs, missing CAN, car metadata |
+| `compare_routes` | Same metrics on two routes side by side with deltas (engagement, health, rates, event counts, field stats), e.g. before/after a tune |
+| `plot_route` | PNG of cereal fields (`carState/vEgo`) and DBC signals (`can:0x415:VehYawNonLin_W_Rq@0`), one panel each or overlaid, optionally with a second route overlaid |
 | `panda_safety_config` | Safety model(s) + param + alternativeExperience the route ran with |
 | `panda_blocked_messages` | **Hardware truth**: sendcan frames whose echo never hit the bus |
 | `panda_replay` | Replay sendcan through the real opendbc safety model; report blocked TX |

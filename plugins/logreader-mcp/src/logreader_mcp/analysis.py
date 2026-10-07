@@ -142,9 +142,9 @@ def can_summary(rd: RouteData, stream: str = "can", bus: int | None = None) -> d
           "n_addresses": len(rows), "addresses": rows}
 
 
-def decode_signal(rd: RouteData, address: int, signal: str, bus: int = 0,
-                  dbc_name: str | None = None, stream: str = "can",
-                  max_points: int = 2000) -> dict[str, Any]:
+# decoded signal as (t seconds, values, dbc name), or an error dict
+def decode_series(rd: RouteData, address: int, signal: str, bus: int = 0, dbc_name: str | None = None,
+                  stream: str = "can") -> tuple[np.ndarray, np.ndarray, str] | dict[str, Any]:
   from opendbc.can.parser import CANParser
   if dbc_name is None:
     fp, plat = _platform(rd)
@@ -175,8 +175,16 @@ def decode_signal(rd: RouteData, address: int, signal: str, bus: int = 0,
       out_v.append(val)
   if not out_v:
     return {"error": f"signal '{signal}' not produced; check signal name and dbc '{dbc_name}'"}
-  t = np.asarray(out_t)
-  v = np.asarray(out_v)
+  return np.asarray(out_t), np.asarray(out_v), dbc_name
+
+
+def decode_signal(rd: RouteData, address: int, signal: str, bus: int = 0,
+                  dbc_name: str | None = None, stream: str = "can",
+                  max_points: int = 2000) -> dict[str, Any]:
+  res = decode_series(rd, address, signal, bus, dbc_name, stream)
+  if isinstance(res, dict):
+    return res
+  t, v, dbc_name = res
   td, vd = _downsample(t, v, max_points)
   return {"dbc": dbc_name, "address": hex(address), "bus": bus, "signal": signal,
           "n": len(v), "returned": len(td), "t": _to_list(td), "v": _to_list(vd)}
@@ -216,7 +224,7 @@ def events_timeline(rd: RouteData, max_events: int = 500) -> dict[str, Any]:
     names = []
     for ev in msg.onroadEvents:
       try:
-        names.append(ev.name)
+        names.append(str(ev.name))
       except Exception:
         pass
     if names:

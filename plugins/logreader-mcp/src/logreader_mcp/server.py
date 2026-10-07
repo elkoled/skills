@@ -3,10 +3,10 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from . import analysis, panda
+from . import analysis, compare, panda, plot
 from .route_cache import clear_cache, get_route
 
 mcp = MCPServer(
@@ -156,6 +156,50 @@ def panda_root_cause(route: str, address: int | None = None, bus: int | None = N
 
   Filter to one address/bus and/or a time window to keep it fast and focused."""
   return panda.root_cause(_rd(route), address, bus, t_start, t_end, max_groups)
+
+
+@mcp.tool()
+def compare_routes(route_a: str, route_b: str, fields: list[str] | None = None, mode: str = "r") -> dict[str, Any]:
+  """Same metrics on two routes side by side with b - a deltas, e.g. before and after a tune.
+
+  Covers car, duration, engagement (time, fraction, engage/disengage counts), health findings,
+  service rates, onroadEvents transition counts, and mean/std/min/max/abs_mean of fields.
+  fields: 'service/field' or 'can:0xADDR:SIGNAL[@bus][#dbc]' specs (same as plot). Defaults to
+  vEgo, aEgo, steering angle/torque, actuator accel/torque/curvature, curvature and aTarget.
+  Both routes load in parallel."""
+  from concurrent.futures import ThreadPoolExecutor
+  with ThreadPoolExecutor(2) as ex:
+    a, b = ex.map(lambda r: _rd(r, mode), (route_a, route_b))
+  return compare.compare(a, b, fields)
+
+
+@mcp.tool()
+def plot_route(route: str, series: list[str], t_start: float | None = None, t_end: float | None = None,
+               route_b: str | None = None, overlay: bool = False, mode: str = "r") -> list:
+  """Plot fields and DBC signals to a PNG instead of returning raw arrays.
+
+  series: 'service/field' (nested with '/', e.g. 'carState/vEgo', 'carControl/actuators/accel')
+  or 'can:0xADDR:SIGNAL[@bus][#dbc]' / 'sendcan:...' for a decoded DBC signal (dbc defaults to the
+  car's powertrain DBC). Enum fields plot as category indexes. One panel per series unless
+  overlay=True. t_start/t_end are seconds since route start. route_b overlays the same series
+  from a second route on each panel (time since its own start), for before/after comparisons."""
+  rds = [(route, _rd(route, mode))] + ([(route_b, _rd(route_b, mode))] if route_b else [])
+  lines, errors = [], []
+  for spec in series:
+    for name, rd in rds:
+      res = plot.series(rd, spec)
+      if isinstance(res, str):
+        errors.append(f"{name}: {res}")
+        continue
+      label = spec if not route_b else f"{spec} ({'a' if rd is rds[0][1] else 'b'})"
+      lines.append(("all" if overlay else spec, label, *res))
+  if not lines:
+    raise ToolError("nothing to plot: " + "; ".join(errors))
+  title = route if not route_b else f"a: {route}   b: {route_b}"
+  out: list = [Image(data=plot.render(lines, t_start, t_end, title), format="png")]
+  if errors:
+    out.append("skipped: " + "; ".join(errors))
+  return out
 
 
 def main():
