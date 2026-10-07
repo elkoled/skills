@@ -43,9 +43,10 @@ screenshot in the tool result, so you see the effect of each action immediately.
 ## Videos and before/after comparisons
 
 For a video of the onroad UI, use `render_clip` instead of screenshotting a live replay. It
-renders offline with the checkout's `tools/clip/run.py` (no `start_ui` needed). With a clip
-tool that streams the decode and drives UI timers from the frame clock it runs about 10x
-realtime and renders the same at any speed. Older clip tools are slower.
+renders offline with the checkout's `tools/clip/run.py` (no `start_ui` needed), always through
+the plugin's `clip_runner.py`, which adds streaming decode and a frame clock when the checkout's
+clip tool lacks them. So every render runs about 10x realtime and comes out the same at any
+render speed, on any checkout.
 `compare_ref="master"` (or any ref) renders that ref's UI python on top and the working
 tree below in one stacked mp4. Empty route is the demo route (90s-105s), pass `start`/`end`
 seconds for another range. Text overlays are off unless `overlays=True`.

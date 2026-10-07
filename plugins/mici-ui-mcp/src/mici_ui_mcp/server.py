@@ -47,7 +47,7 @@ SETTLE_MAX = 0.5
 SWIPE_STEPS = 24
 
 CLIP_DIR = Path("/tmp/op_ui_mcp_clips")
-CLIP_OVERLAY = Path(__file__).resolve().parent / "clip_overlay.py"
+CLIP_RUNNER = Path(__file__).resolve().parent / "clip_runner.py"
 
 
 # a pip/venv ffmpeg on PATH can lack filters like pad, prefer the system build
@@ -562,7 +562,7 @@ class UISession:
     return res.stdout
 
   # write the ref's version of every UI python file that differs from the working tree,
-  # named by module so clip_overlay.py can import them in place of the checkout's copy
+  # named by module so clip_runner.py can import them in place of the checkout's copy
   def _ref_overlay(self, ref: str, overlay_dir: Path) -> list[str]:
     self._git("rev-parse", "--verify", f"{ref}^{{commit}}")
     ui_dirs = [self._rel("selfdrive", "ui"), self._rel("system", "ui")]
@@ -607,21 +607,23 @@ class UISession:
     out = Path(output).expanduser().resolve() if output else CLIP_DIR / f"clip_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
     work = Path(tempfile.mkdtemp(prefix="clip_", dir=CLIP_DIR))
 
-    # (label, command, output) per render, all run in parallel
-    renders = [("current", [*self._python(), str(clip_script), *clip_args], out if not compare_ref else work / "current.mp4")]
+    # (label, overlay dir, output) per render, all run in parallel through clip_runner.py, which
+    # adds streaming decode and the frame clock when the checkout's clip tool lacks them
+    renders = [("current", "", out if not compare_ref else work / "current.mp4")]
     overlay_modules: list[str] = []
     if compare_ref:
       overlay_dir = work / "overlay"
       overlay_dir.mkdir()
       overlay_modules = self._ref_overlay(compare_ref, overlay_dir)
-      renders.insert(0, (compare_ref, [*self._python(), str(CLIP_OVERLAY), str(overlay_dir), str(clip_script), *clip_args], work / "ref.mp4"))
+      renders.insert(0, (compare_ref, str(overlay_dir), work / "ref.mp4"))
 
     t0 = time.monotonic()
     procs = []
-    for i, (label, cmd, dst) in enumerate(renders):
+    for i, (label, overlay, dst) in enumerate(renders):
       log = work / f"render{i}.log"
+      cmd = [*self._python(), str(CLIP_RUNNER), overlay, str(clip_script), *clip_args, "-o", str(dst)]
       with open(log, "w") as log_f:
-        procs.append((label, dst, log, subprocess.Popen([*cmd, "-o", str(dst)], cwd=str(self.root), env=self._env(),
+        procs.append((label, dst, log, subprocess.Popen(cmd, cwd=str(self.root), env=self._env(),
                                                         stdout=log_f, stderr=subprocess.STDOUT,
                                                         stdin=subprocess.DEVNULL, start_new_session=True)))
     warnings = []

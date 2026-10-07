@@ -53,7 +53,7 @@ not built. Both the flat layout and the nested one (source under
 | `clear_alerts()` | clear a sticky onroad alert left on screen after a publish |
 | `start_replay(route, dcam?, ecam?)` | replay a route (empty = demo route) into the running UI |
 | `stop_replay()` | stop replay |
-| `render_clip(route?, start?, end?, compare_ref?, big?, qcam?, overlays?, output?)` | render the onroad UI over a route to an mp4 offline, faster than realtime, via `tools/clip/run.py`. `compare_ref` renders that git ref's UI on top and the working tree below, in parallel. Returns the path and a middle-frame preview |
+| `render_clip(route?, start?, end?, compare_ref?, big?, qcam?, overlays?, output?)` | render the onroad UI over a route to an mp4 offline, faster than realtime, via `tools/clip/run.py`, always with streaming decode and a frame clock (patched in by `clip_runner.py` when the checkout lacks them). `compare_ref` renders that git ref's UI on top and the working tree below, in parallel. Returns the path and a middle-frame preview |
 | `status()` / `logs(lines?)` | session state / tail the UI log |
 
 ### Coordinates
