@@ -37,8 +37,12 @@ screenshot in the tool result, so you see the effect of each action immediately.
    coordinates. Each returns a fresh screenshot to confirm the result.
 3. For a multi-step flow use `run` with a chain script (one call, all captures returned).
 4. After editing UI code, `restart_ui` to reload it.
-5. `start_replay` (empty route uses the demo route) to drive the onroad UI with real
+5. `start_replay` (empty route uses the demo route from 90s, already engaged) to drive the onroad UI with real
    data; `stop_replay` when done. `stop_ui` frees everything.
+
+`start_replay` blocks until the onroad camera is playing (about 5s, 2.5s of that is the UI's
+own onroad delay) and returns a screenshot, so don't poll with `screenshot`. Pass `start`
+seconds to jump into a route and `speed` to play faster.
 
 ## Videos and before/after comparisons
 

@@ -45,6 +45,9 @@ SETTLE_MIN = 0.08
 SETTLE_STABLE = 0.1
 SETTLE_MAX = 0.5
 SWIPE_STEPS = 24
+REPLAY_READY_TIMEOUT = 40.0
+ONROAD_MOTION = 1.5  # seconds of continuous change that only a playing camera produces
+DEMO_START = 90  # the demo route is engaged and moving here, it only engages ~20s in
 
 CLIP_DIR = Path("/tmp/op_ui_mcp_clips")
 CLIP_RUNNER = Path(__file__).resolve().parent / "clip_runner.py"
@@ -143,6 +146,11 @@ class UISession:
   # nested layout imports openpilot.* so the repo root must be on PYTHONPATH
   def _env(self) -> dict:
     env = dict(os.environ)
+    # replay shells out to python3 to download segments, it must find the checkout's venv,
+    # not the plugin's own uv env that run.sh puts first on PATH
+    venv_bin = self.root / ".venv" / "bin"
+    if venv_bin.exists():
+      env["PATH"] = str(venv_bin) + os.pathsep + env.get("PATH", "")
     if self.pkg_prefix:
       existing = env.get("PYTHONPATH")
       env["PYTHONPATH"] = str(self.root) + (os.pathsep + existing if existing else "")
@@ -529,6 +537,26 @@ class UISession:
     alive = self._replay.poll() is None
     return {"replay_started": alive, "args": args, "replay_log": self.replay_log}
 
+  # onroad shows the camera, so the screen changes every frame. offroad is static, and the
+  # scroll into onroad (after the UI's own ~2.5s ONROAD_DELAY) moves for under a second
+  def wait_onroad(self, timeout: float = REPLAY_READY_TIMEOUT) -> bool:
+    start = time.monotonic()
+    prev = self._grab().tobytes()
+    moving_since = None
+    while time.monotonic() - start < timeout:
+      if self._replay is None or self._replay.poll() is not None:
+        return False
+      time.sleep(0.1)
+      cur = self._grab().tobytes()
+      if cur != prev:
+        moving_since = moving_since or time.monotonic()
+        if time.monotonic() - moving_since >= ONROAD_MOTION:
+          return True
+      else:
+        moving_since = None
+      prev = cur
+    return False
+
   def stop_replay(self, quiet: bool = False) -> dict:
     self._kill_proc("_replay")
     return {} if quiet else {"replay_stopped": True}
@@ -849,17 +877,35 @@ def clear_alerts() -> list:
 
 
 @mcp.tool()
-def start_replay(route: str = "", dcam: bool = False, ecam: bool = False) -> str:
+def start_replay(route: str = "", dcam: bool = False, ecam: bool = False, start: int | None = None,
+                 speed: float = 1.0, wait: bool = True) -> list:
   """Replay a route so the onroad UI shows real data. Empty route uses --demo.
 
   Start the UI first; replay shares its msgq. dcam/ecam load driver/wide cameras.
+  start: seconds into the route. Defaults to 90 for the demo (already engaged and driving,
+  it only engages ~20s in) and 0 for other routes. speed: playback speed multiplier.
+  wait: block until the onroad camera is playing (about 5s, the UI itself holds offroad
+  for ~2.5s) and return a screenshot, so no screenshot polling is needed.
+  For offline video or before/after comparisons use render_clip instead.
   """
   extra = []
   if dcam:
     extra.append("--dcam")
   if ecam:
     extra.append("--ecam")
-  return str(SESSION.start_replay(route, extra))
+  if start is None and not route:
+    start = DEMO_START
+  if start:
+    extra += ["-s", str(start)]
+  if speed != 1.0:
+    extra += ["-x", str(speed)]
+  status = SESSION.start_replay(route, extra)
+  out: list = [str(status)]
+  if wait and status["replay_started"]:
+    if not SESSION.wait_onroad():
+      out.append(f"onroad camera not playing after {REPLAY_READY_TIMEOUT}s; see {SESSION.replay_log}")
+    out.append(_img(SESSION.settled_screenshot()))
+  return out
 
 
 @mcp.tool()
