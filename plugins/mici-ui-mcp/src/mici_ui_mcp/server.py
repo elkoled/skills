@@ -19,8 +19,10 @@ import io
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -43,6 +45,14 @@ SETTLE_MIN = 0.08
 SETTLE_STABLE = 0.1
 SETTLE_MAX = 0.5
 SWIPE_STEPS = 24
+
+CLIP_DIR = Path("/tmp/op_ui_mcp_clips")
+CLIP_OVERLAY = Path(__file__).resolve().parent / "clip_overlay.py"
+
+
+# a pip/venv ffmpeg on PATH can lack filters like pad, prefer the system build
+def _ff(name: str) -> str:
+  return f"/usr/bin/{name}" if os.path.exists(f"/usr/bin/{name}") else (shutil.which(name) or name)
 
 
 # nested layout keeps SConstruct at root but moves the source under openpilot/
@@ -545,6 +555,103 @@ class UISession:
     except OSError:
       return ""
 
+  def _git(self, *args: str) -> str:
+    res = subprocess.run(["git", "-C", str(self.root), *args], capture_output=True, text=True)
+    if res.returncode != 0:
+      raise UISessionError(f"git {' '.join(args)} failed: {res.stderr.strip()}")
+    return res.stdout
+
+  # write the ref's version of every UI python file that differs from the working tree,
+  # named by module so clip_overlay.py can import them in place of the checkout's copy
+  def _ref_overlay(self, ref: str, overlay_dir: Path) -> list[str]:
+    self._git("rev-parse", "--verify", f"{ref}^{{commit}}")
+    ui_dirs = [self._rel("selfdrive", "ui"), self._rel("system", "ui")]
+    modules = []
+    for path in self._git("diff", "--name-only", ref, "--", *ui_dirs).split():
+      if not path.endswith(".py") or path.endswith("__init__.py"):
+        continue
+      res = subprocess.run(["git", "-C", str(self.root), "show", f"{ref}:{path}"], capture_output=True)
+      if res.returncode != 0:  # new in the working tree, only new code imports it
+        continue
+      rel = Path(path).relative_to(self.pkg_prefix) if self.pkg_prefix else Path(path)
+      module = "openpilot." + ".".join(rel.with_suffix("").parts)
+      (overlay_dir / f"{module}.py").write_bytes(res.stdout)
+      modules.append(module)
+    return modules
+
+  def render_clip(self, route: str = "", start: int | None = None, end: int | None = None,
+                  compare_ref: str = "", big: bool = False, qcam: bool = False,
+                  overlays: bool = False, output: str = "") -> tuple[dict, Path]:
+    clip_script = self.root / self._rel("tools", "clip", "run.py")
+    if not clip_script.exists():
+      raise UISessionError(f"no clip tool at {clip_script}")
+    if not _is_built(self.root):
+      raise UISessionError(f"{self.root} is not built (no msgq ipc_pyx); run `scons -j$(nproc)` there")
+    if route and (start is None or end is None) and route.count("/") != 3:
+      raise UISessionError("pass start and end (seconds) with a route, or route as dongle/route/start/end")
+
+    clip_args = [route] if route else ["--demo"]
+    if start is not None:
+      clip_args += ["-s", str(start)]
+    if end is not None:
+      clip_args += ["-e", str(end)]
+    clip_args += ["-f", "0"]  # constant quality, not squeezed into a target size
+    if big:
+      clip_args.append("--big")
+    if qcam:
+      clip_args.append("--qcam")
+    if not overlays:
+      clip_args += ["--no-metadata", "--no-time-overlay"]
+
+    CLIP_DIR.mkdir(parents=True, exist_ok=True)
+    out = Path(output).expanduser().resolve() if output else CLIP_DIR / f"clip_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+    work = Path(tempfile.mkdtemp(prefix="clip_", dir=CLIP_DIR))
+
+    # (label, command, output) per render, all run in parallel
+    renders = [("current", [*self._python(), str(clip_script), *clip_args], out if not compare_ref else work / "current.mp4")]
+    overlay_modules: list[str] = []
+    if compare_ref:
+      overlay_dir = work / "overlay"
+      overlay_dir.mkdir()
+      overlay_modules = self._ref_overlay(compare_ref, overlay_dir)
+      renders.insert(0, (compare_ref, [*self._python(), str(CLIP_OVERLAY), str(overlay_dir), str(clip_script), *clip_args], work / "ref.mp4"))
+
+    t0 = time.monotonic()
+    procs = []
+    for i, (label, cmd, dst) in enumerate(renders):
+      log = work / f"render{i}.log"
+      with open(log, "w") as log_f:
+        procs.append((label, dst, log, subprocess.Popen([*cmd, "-o", str(dst)], cwd=str(self.root), env=self._env(),
+                                                        stdout=log_f, stderr=subprocess.STDOUT,
+                                                        stdin=subprocess.DEVNULL, start_new_session=True)))
+    warnings = []
+    for label, dst, log, proc in procs:
+      rc = proc.wait()
+      # an end past the last camera frame exits nonzero after the clip is already written
+      if not dst.exists() or dst.stat().st_size == 0:
+        raise UISessionError(f"render of {label} failed (code {rc}):\n{self._read_log(str(log), 15)}")
+      if rc != 0:
+        warnings.append(f"{label} exited {rc} after writing the clip: {self._read_log(str(log), 1)}")
+
+    if compare_ref:
+      res = subprocess.run([_ff("ffmpeg"), "-y", "-v", "error", "-i", str(renders[0][2]), "-i", str(renders[1][2]), "-filter_complex",
+                            "[0:v]pad=w=iw:h=ih+4:x=0:y=0:color=white[top];[top][1:v]vstack=inputs=2:shortest=1",
+                            "-c:v", "libx264", "-crf", "20", "-preset", "veryfast", "-an", str(out)], capture_output=True, text=True)
+      if res.returncode != 0:
+        raise UISessionError(f"stacking failed: {res.stderr.strip()}")
+
+    result = {
+      "output": str(out),
+      "seconds": round(time.monotonic() - t0, 1),
+      "layout": f"top={compare_ref}, bottom=working tree" if compare_ref else "working tree",
+      "work_dir": str(work),
+    }
+    if compare_ref:
+      result["ref_modules"] = overlay_modules
+    if warnings:
+      result["warnings"] = warnings
+    return result, out
+
   def logs(self, lines: int = 40) -> str:
     return self._read_log(self.ui_log, lines) if self.ui_log else "(no UI log yet)"
 
@@ -757,6 +864,42 @@ def start_replay(route: str = "", dcam: bool = False, ecam: bool = False) -> str
 def stop_replay() -> str:
   """Stop the running replay."""
   return str(SESSION.stop_replay())
+
+
+# middle frame of a clip as a quick look, so the caller doesn't need to open the video
+def _clip_preview(path: Path) -> Image | None:
+  probe = subprocess.run([_ff("ffprobe"), "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+                         capture_output=True, text=True)
+  try:
+    mid = float(probe.stdout.strip()) / 2
+  except ValueError:
+    mid = 0.0
+  res = subprocess.run([_ff("ffmpeg"), "-v", "error", "-ss", f"{mid:.2f}", "-i", str(path), "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"],
+                       capture_output=True)
+  return Image(data=res.stdout, format="png") if res.returncode == 0 and res.stdout else None
+
+
+@mcp.tool()
+def render_clip(route: str = "", start: int | None = None, end: int | None = None, compare_ref: str = "",
+                big: bool = False, qcam: bool = False, overlays: bool = False, output: str = "") -> list:
+  """Render the onroad UI over a route to an mp4, offline and faster than realtime (tools/clip/run.py).
+
+  Independent of start_ui, no running UI needed. Empty route uses the demo route (90s-105s unless
+  start/end given). start/end are seconds into the route, required with a route unless it is
+  dongle/route/start/end. An end past the last camera frame still writes the clip (reported in warnings).
+  compare_ref: a git ref (e.g. 'master', 'HEAD~1', a sha). Renders that ref's UI code on top and the
+  working tree on the bottom, in parallel, stacked into one video. Only python under selfdrive/ui and
+  system/ui is swapped, assets and native code come from the working tree.
+  big: tici layout instead of mici. qcam: low-res road camera, faster. overlays: time and route
+  metadata text (off by default, UI only). output: mp4 path, default /tmp/op_ui_mcp_clips/.
+  Returns the result paths and a preview of the middle frame.
+  """
+  result, out = SESSION.render_clip(route, start, end, compare_ref, big, qcam, overlays, output)
+  content: list = [str(result)]
+  preview = _clip_preview(out)
+  if preview is not None:
+    content.append(preview)
+  return content
 
 
 @mcp.tool()

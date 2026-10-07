@@ -40,6 +40,16 @@ screenshot in the tool result, so you see the effect of each action immediately.
 5. `start_replay` (empty route uses the demo route) to drive the onroad UI with real
    data; `stop_replay` when done. `stop_ui` frees everything.
 
+## Videos and before/after comparisons
+
+For a video of the onroad UI, use `render_clip` instead of screenshotting a live replay. It
+renders offline with the checkout's `tools/clip/run.py` (no `start_ui` needed). With a clip
+tool that streams the decode and drives UI timers from the frame clock it runs about 10x
+realtime and renders the same at any speed. Older clip tools are slower.
+`compare_ref="master"` (or any ref) renders that ref's UI python on top and the working
+tree below in one stacked mp4. Empty route is the demo route (90s-105s), pass `start`/`end`
+seconds for another range. Text overlays are off unless `overlays=True`.
+
 ## Coordinates
 
 Coordinates are the pixels you see in a screenshot: origin top-left, x to the right,
@@ -72,5 +82,5 @@ scaled 1:1, so a point in the screenshot is the point you pass.
 
 `start_ui`, `restart_ui`, `stop_ui`, `status`, `screenshot`, `tap`, `swipe`, `hold`,
 `run`, `set_param`, `publish`, `stop_publish`, `go_offroad`, `clear_alerts`,
-`start_replay`, `stop_replay`, `logs`. Each tool documents its own arguments; read the
+`start_replay`, `stop_replay`, `render_clip`, `logs`. Each tool documents its own arguments; read the
 tool descriptions for details.

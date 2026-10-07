@@ -22,7 +22,7 @@ This plugin is published in the `elkoled-skills` marketplace:
 - A built openpilot checkout (`uv run scons -j$(nproc)`, which builds `msgq`, `cereal`
   and `tools/replay/replay`).
 - `uv` on PATH and `Xvfb` (`apt install xvfb`). Capture uses python-xlib (XGetImage) and
-  touch uses XTEST, so no `xdotool`, `scrot` or `ffmpeg` is needed.
+  touch uses XTEST, so no `xdotool` or `scrot` is needed. Only `render_clip` needs `ffmpeg`.
 
 `run.sh` runs the server in its own small uv env (`mcp>=2.3,<3`, pillow, python-xlib),
 independent of the openpilot venv, so it never syncs or rebuilds the checkout and starts
@@ -53,6 +53,7 @@ not built. Both the flat layout and the nested one (source under
 | `clear_alerts()` | clear a sticky onroad alert left on screen after a publish |
 | `start_replay(route, dcam?, ecam?)` | replay a route (empty = demo route) into the running UI |
 | `stop_replay()` | stop replay |
+| `render_clip(route?, start?, end?, compare_ref?, big?, qcam?, overlays?, output?)` | render the onroad UI over a route to an mp4 offline, faster than realtime, via `tools/clip/run.py`. `compare_ref` renders that git ref's UI on top and the working tree below, in parallel. Returns the path and a middle-frame preview |
 | `status()` / `logs(lines?)` | session state / tail the UI log |
 
 ### Coordinates
