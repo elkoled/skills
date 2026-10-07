@@ -58,6 +58,7 @@ CLIP_DIR = Path("/tmp/op_ui_mcp_clips")
 CLIP_RUNNER = Path(__file__).resolve().parent / "clip_runner.py"
 UI_DIFF_RUNNER = Path(__file__).resolve().parent / "ui_diff_runner.py"
 UI_DIFF_FPS = 60
+OFFROAD_ALERT_REFRESH = 5.0  # REFRESH_INTERVAL in selfdrive/ui/mici/layouts/offroad_alerts.py
 UI_DIFF_GAP = 30  # changed frames closer than this belong to one screen
 
 
@@ -462,24 +463,41 @@ class UISession:
         raise UISessionError(f"[{i}] unknown step: {op!r}")
     return log, shots
 
-  def set_param(self, name: str, value: bool | int | float | str) -> str:
+  # returns whether the key feeds the offroad alert list
+  def set_param(self, name: str, value: bool | int | float | str | dict | list) -> bool:
     self.ensure_prefix()
     # put routes by the value's python type with no coercion, so pass it through as-is.
     # str(v) would break INT/FLOAT params. a bool uses put_bool to be explicit.
-    # json carries the value so nan/inf survive, repr would emit bare NameError tokens
+    # json carries the value so nan/inf survive, repr would emit bare NameError tokens.
+    # block=True returns only once the write is on disk, older Params have no block
     code = (
-      "import json;"
-      "from openpilot.common.params import Params;"
-      f"v = json.loads({json.dumps(value)!r});"
-      "p = Params();"
-      f"p.put_bool({name!r}, v) if isinstance(v, bool) else p.put({name!r}, v);"
-      f"print('set', {name!r})"
+      "import json\n"
+      "from openpilot.common.params import Params\n"
+      f"name, v = {name!r}, json.loads({json.dumps(value)!r})\n"
+      "p = Params()\n"
+      "try:\n"
+      "  from openpilot.selfdrive.selfdrived.alertmanager import OFFROAD_ALERTS\n"
+      "except ImportError:\n"
+      "  OFFROAD_ALERTS = {}\n"
+      "alert = name in OFFROAD_ALERTS or name.startswith('Offroad_') or name in ('UpdaterNewDescription', 'UpdateAvailable')\n"
+      "if name in OFFROAD_ALERTS and isinstance(v, bool):\n"
+      "  # like set_offroad_alert: true shows the alert's own config, false clears it\n"
+      "  v = dict(OFFROAD_ALERTS[name], extra='') if v else None\n"
+      "if v is None:\n"
+      "  p.remove(name)\n"
+      "else:\n"
+      "  put = p.put_bool if isinstance(v, bool) else p.put\n"
+      "  try:\n"
+      "    put(name, v, block=True)\n"
+      "  except TypeError:\n"
+      "    put(name, v)\n"
+      "print(json.dumps({'alert': alert}))\n"
     )
     res = subprocess.run([*self._python(), "-c", code], cwd=str(self.root),
                          env=self._env(), capture_output=True, text=True, timeout=120)
     if res.returncode != 0:
       raise UISessionError(f"set_param failed: {res.stderr.strip() or res.stdout.strip()}")
-    return res.stdout.strip()
+    return bool(json.loads(res.stdout.strip().splitlines()[-1])["alert"])
 
   def publish(self, service: str, fields: dict, hz: float = 0.0, secs: float = 0.0,
               background: bool = False) -> str:
@@ -927,18 +945,26 @@ def run(script: str) -> list:
 
 
 @mcp.tool()
-def set_param(name: str, value: bool | int | float | str, restart: bool = False) -> str:
+def set_param(name: str, value: bool | int | float | str | dict | list, restart: bool = False) -> str:
   """Write an openpilot Param (e.g. ShowDebugInfo=true for the touch/widget overlay).
 
   value type must match the param type (no coercion): bool for BOOL, int for INT,
-  float for FLOAT, str for STRING (so pass true/false for a BOOL param, not 1/0).
-  Params are read at UI start, so pass restart=True to relaunch the UI afterwards.
+  float for FLOAT, str for STRING, dict/list for JSON (so pass true/false for a BOOL param, not 1/0).
+  For an offroad alert key (e.g. Offroad_TemperatureTooHigh), true shows the alert with its standard
+  text and false clears it, like openpilot's set_offroad_alert.
+  The write blocks until it is on disk. Most params are read at UI start, so pass restart=True
+  to relaunch the UI afterwards. Offroad alert params (Offroad_*, UpdateAvailable, ...) are
+  polled by the UI every 5s, so without a restart this waits that long for them to show.
   """
-  msg = SESSION.set_param(name, value)
+  alert = SESSION.set_param(name, value)
+  msg = f"set {name}"
   if restart and SESSION.is_running():
     SESSION.stop(quiet=True)
     SESSION.start(mode=SESSION.mode)
     msg += " (UI restarted)"
+  elif alert and SESSION.is_running():
+    time.sleep(OFFROAD_ALERT_REFRESH + 0.5)
+    msg += f" (offroad alert param, waited {OFFROAD_ALERT_REFRESH + 0.5:.1f}s for the UI's alert refresh)"
   return msg
 
 

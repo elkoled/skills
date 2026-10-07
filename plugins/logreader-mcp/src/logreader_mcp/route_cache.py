@@ -113,8 +113,22 @@ class CanIndex:
     return [buf[o:o + n] for o, n in zip(self.off.tolist(), self.ln.tolist(), strict=True)]
 
 
+def _is_list(v) -> bool:
+  return type(v).__name__ in ("_DynamicListReader", "_DynamicListBuilder")
+
+
+# 'a/b/c' through structs. on a list (list-type services like pandaStates or onroadEvents, or
+# list fields) a numeric part picks that element, any other part reads from the first element.
+# a missing element reads as None
 def _get_path(msg, parts: list[str]):
   for p in parts:
+    if _is_list(msg):
+      i = int(p) if p.isdigit() else 0
+      if i >= len(msg):
+        return None
+      msg = msg[i]
+      if p.isdigit():
+        continue
     msg = getattr(msg, p)
   return msg
 
@@ -184,10 +198,18 @@ class RouteData:
     if key not in self._fields:
       parts = path.split("/")
       vals = [_get_path(m, [service, *parts]) for m in self.msgs(service)]
-      if vals and not isinstance(vals[0], (bool, int, float, str)):
+      present = next((v for v in vals if v is not None), None)
+      if present is None and vals:
+        self._fields[key] = np.full(len(vals), np.nan)
+        return self._fields[key]
+      if isinstance(present, (bool, int, float)) and not isinstance(present, str) and None in vals:
+        vals = [np.nan if v is None else v for v in vals]  # empty list element, e.g. no panda yet
+      elif None in vals:
+        vals = ["" if v is None else v for v in vals]
+      if vals and not isinstance(present, (bool, int, float, str)):
         # enums read as their name, lists and structs stay objects so callers see them as non-scalar
         vals = [str(v) if type(v).__name__ == "_DynamicEnum" else v for v in vals]
-        if isinstance(vals[0], str):
+        if all(isinstance(v, str) for v in vals):
           self._fields[key] = np.array(vals)
         else:
           # fill one by one, np.array would unpack capnp lists into a 2d array
@@ -199,7 +221,12 @@ class RouteData:
         self._fields[key] = np.array(vals)
     return self._fields[key]
 
-  # flattened field names of one message, nested structs joined by '/'
+  def is_list_service(self, service: str) -> bool:
+    msgs = self.msgs(service)
+    return bool(msgs) and _is_list(getattr(msgs[0], service))
+
+  # flattened field names of one message, nested structs joined by '/'. for a list-type service,
+  # the fields of its elements (from the first message with one)
   def field_names(self, service: str) -> list[str]:
     msgs = self.msgs(service)
     if not msgs:
@@ -213,8 +240,18 @@ class RouteData:
           walk(v, p)
         else:
           names.append(p)
-    walk(getattr(msgs[0], service).to_dict(verbose=True), "")
+    root = getattr(msgs[0], service)
+    if _is_list(root):
+      root = next((r[0] for r in (getattr(m, service) for m in msgs) if len(r)), None)
+      if root is None:
+        return []
+    walk(root.to_dict(verbose=True), "")
     return names
+
+  # every segment came from qlogs, which keep only every n-th message of a service
+  @property
+  def is_qlog(self) -> bool:
+    return all("qlog" in i.split("?")[0].rsplit("/", 1)[-1] for i in self.ids)
 
   @property
   def car_params(self):

@@ -75,6 +75,10 @@ scaled 1:1, so a point in the screenshot is the point you pass.
 
 ## Behavior to know
 
+- `set_param` blocks until the write is on disk. Offroad alerts: `set_param("Offroad_TemperatureTooHigh", true)`
+  shows the alert with its standard text, `false` clears it. The UI polls alert params every 5s,
+  so these calls wait that long before returning (`restart=True` is faster if UI state doesn't matter).
+
 - Each server process runs the UI, replay and publishers under its own `OPENPILOT_PREFIX`
   (`status` shows it), so concurrent sessions don't collide on msgq. Params start as a copy of
   the default `~/.comma/params` and are removed when the server exits.

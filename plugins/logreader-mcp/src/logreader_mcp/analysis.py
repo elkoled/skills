@@ -45,7 +45,11 @@ def list_fields(rd: RouteData, service: str) -> dict[str, Any]:
   counts = rd.service_counts
   if service not in counts:
     return {"error": f"service '{service}' not in route", "available": sorted(counts)[:60]}
-  return {"service": service, "n_samples": counts[service], "fields": sorted(rd.field_names(service))}
+  out = {"service": service, "n_samples": counts[service], "fields": sorted(rd.field_names(service))}
+  if rd.is_list_service(service):
+    out["note"] = (f"'{service}' is a list per message. 'field' reads the first element, prefix an index "
+                   "for another one (e.g. '1/ignitionLine'). For onroadEvents use events_timeline")
+  return out
 
 
 def _scalar_series(rd: RouteData, service: str, field: str,
@@ -94,8 +98,8 @@ def summarize_field(rd: RouteData, service: str, field: str) -> dict[str, Any]:
     "max": float(np.max(finite)) if len(finite) else None,
     "mean": float(np.mean(finite)) if len(finite) else None,
     "std": float(np.std(finite)) if len(finite) else None,
-    "first": float(v[0]) if len(v) else None,
-    "last": float(v[-1]) if len(v) else None,
+    "first": float(v[0]) if len(v) and np.isfinite(v[0]) else None,
+    "last": float(v[-1]) if len(v) and np.isfinite(v[-1]) else None,
     "avg_hz": round(1.0 / float(np.mean(dt)), 2) if len(dt) and np.mean(dt) > 0 else None,
     "max_gap_s": float(np.max(dt)) if len(dt) else None,
   }
@@ -217,12 +221,13 @@ def changing_bits(rd: RouteData, address: int, bus: int = 0, stream: str = "can"
 def events_timeline(rd: RouteData, max_events: int = 500) -> dict[str, Any]:
   out = []
   t0 = None
-  for msg in rd.msgs("onroadEvents"):
+  svc = next((s for s in ("onroadEvents", "onroadEventsDEPRECATED") if s in rd.service_counts), "onroadEvents")
+  for msg in rd.msgs(svc):
     t = msg.logMonoTime / 1e9
     if t0 is None:
       t0 = t
     names = []
-    for ev in msg.onroadEvents:
+    for ev in getattr(msg, svc):
       try:
         names.append(str(ev.name))
       except Exception:
@@ -280,10 +285,27 @@ EXPECTED_HZ = {
 }
 
 
+# expected rate from cereal's service list. qlogs keep every decimation-th message, services
+# without a decimation are not in qlogs at all
+def expected_hz(svc: str, qlog: bool) -> float | None:
+  from openpilot.cereal.services import SERVICE_LIST
+  info = SERVICE_LIST.get(svc)
+  freq = info.frequency if info is not None else EXPECTED_HZ.get(svc)
+  if not qlog:
+    return freq
+  if info is None or not info.decimation:
+    return None
+  return info.frequency / info.decimation
+
+
 def health_scan(rd: RouteData) -> dict[str, Any]:
   dur = rd.duration_s() or 1.0
   findings = []
-  for svc, exp in EXPECTED_HZ.items():
+  qlog = rd.is_qlog
+  for svc in EXPECTED_HZ:
+    exp = expected_hz(svc, qlog)
+    if exp is None:
+      continue
     if svc in rd.service_counts:
       hz = rd.service_counts[svc] / dur
       if hz < exp * 0.7:
@@ -317,5 +339,5 @@ def health_scan(rd: RouteData) -> dict[str, Any]:
     meta = {"carFingerprint": cp.carFingerprint,
             "safetyConfigs": [{"model": str(sc.safetyModel), "param": int(sc.safetyParam)}
                               for sc in cp.safetyConfigs]}
-  return {"route": rd.identifier, "duration_s": round(dur, 2),
+  return {"route": rd.identifier, "duration_s": round(dur, 2), "log": "qlog" if qlog else "rlog",
           "car": meta, "n_findings": len(findings), "findings": findings}

@@ -14,14 +14,14 @@ works: comma-connect route names (using your `~/.comma/auth.json` token),
 | Tool | What it does |
 |------|--------------|
 | `load_route` | Warm-load a route, return car + duration + top services |
-| `list_services` / `list_fields` | Enumerate cereal services and their fields |
+| `list_services` / `list_fields` | Enumerate cereal services and their fields. List-type services (`pandaStates`, `onroadEvents`) read their first element, prefix an index for others (`1/ignitionLine`) |
 | `get_field` / `summarize_field` | Time series / stats for any cereal scalar (e.g. `carState.vEgo`) |
 | `route_dbcs` | DBC names for the car, by bus |
 | `can_summary` | Per-address CAN traffic (count, dlc, rate) for `can` or `sendcan` |
 | `decode_signal` | Decode a DBC signal to a time series |
 | `changing_bits` | Which bits of a raw address toggle (reverse engineering) |
 | `events_timeline` / `engagement_summary` | Alerts timeline and engage/disengage transitions |
-| `health_scan` | One call: low rates, gaps, NaNs, missing CAN, car metadata |
+| `health_scan` | One call: low rates, gaps, NaNs, missing CAN, car metadata. Expected rates come from cereal's service list, divided by the qlog decimation for qlogs |
 | `compare_routes` | Same metrics on two routes side by side with deltas (engagement, health, rates, event counts, field stats), e.g. before/after a tune |
 | `plot_route` | PNG of cereal fields (`carState/vEgo`) and DBC signals (`can:0x415:VehYawNonLin_W_Rq@0`), one panel each or overlaid, optionally with a second route overlaid |
 | `panda_safety_config` | Safety model(s) + param + alternativeExperience the route ran with |
