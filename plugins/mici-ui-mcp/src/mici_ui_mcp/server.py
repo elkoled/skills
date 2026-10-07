@@ -49,6 +49,10 @@ SWIPE_STEPS = 24
 REPLAY_READY_TIMEOUT = 40.0
 ONROAD_MOTION = 0.3  # seconds of continuous change, with instant onroad only a playing camera does that
 DEMO_START = 90  # the demo route is engaged and moving here, it only engages ~20s in
+DEMO_ROUTE = "5beb9b58bd12b691/0000010a--a51155e496"
+ROUTE_CACHE = Path("/tmp/op_ui_mcp_routes")
+ROUTE_CACHE_SEGMENTS = 3
+ROUTE_CACHE_SCRIPT = Path(__file__).resolve().parent / "route_cache.py"
 
 CLIP_DIR = Path("/tmp/op_ui_mcp_clips")
 CLIP_RUNNER = Path(__file__).resolve().parent / "clip_runner.py"
@@ -110,6 +114,9 @@ class UISession:
     self.pkg_prefix = _pkg_prefix(root) or ""
     self.mode = "small"
     self.instant_onroad = True
+    # own msgq/params namespace, so concurrent sessions (or a running openpilot) don't collide
+    self.prefix = f"op_ui_mcp_{os.getpid()}"
+    self._prefix_ready = False
     self.width = 0
     self.height = 0
     self.display_num: int | None = None
@@ -142,6 +149,35 @@ class UISession:
     self.pkg_prefix = prefix
 
   # path under the checkout, prefixed for the nested layout
+  # first use: create the msgq dir, start from a copy of the default params (so no onboarding)
+  # and link the comma auth, which lives under the prefixed home too
+  def ensure_prefix(self) -> None:
+    if self._prefix_ready:
+      return
+    os.makedirs(f"/dev/shm/msgq_{self.prefix}", exist_ok=True)
+    home = Path.home() / f".comma{self.prefix}"
+    home.mkdir(exist_ok=True)
+    auth = Path.home() / ".comma" / "auth.json"
+    if auth.exists() and not (home / "auth.json").exists():
+      (home / "auth.json").symlink_to(auth)
+    code = (
+      "import os, shutil\n"
+      "from openpilot.common.params import Params\n"
+      "src, dst = os.path.expanduser('~/.comma/params/d'), Params().get_param_path()\n"
+      "for f in os.listdir(src) if os.path.isdir(src) else []:\n"
+      "  if os.path.isfile(os.path.join(src, f)):\n"
+      "    shutil.copy2(os.path.join(src, f), dst)\n"
+    )
+    res = subprocess.run([*self._python(), "-c", code], cwd=str(self.root), env=self._env(), capture_output=True, text=True, timeout=60)
+    if res.returncode != 0:
+      raise UISessionError(f"setting up prefix {self.prefix} failed: {res.stderr.strip()}")
+    self._prefix_ready = True
+
+  def cleanup_prefix(self) -> None:
+    shutil.rmtree(f"/dev/shm/msgq_{self.prefix}", ignore_errors=True)
+    shutil.rmtree(Path.home() / f".comma{self.prefix}", ignore_errors=True)
+    self._prefix_ready = False
+
   def _rel(self, *parts: str) -> str:
     return str(Path(self.pkg_prefix, *parts))
 
@@ -153,6 +189,8 @@ class UISession:
     venv_bin = self.root / ".venv" / "bin"
     if venv_bin.exists():
       env["PATH"] = str(venv_bin) + os.pathsep + env.get("PATH", "")
+    env["OPENPILOT_PREFIX"] = self.prefix
+    env.setdefault("COMMA_CACHE", "/tmp/comma_download_cache")  # share downloads across prefixes
     if self.pkg_prefix:
       existing = env.get("PYTHONPATH")
       env["PYTHONPATH"] = str(self.root) + (os.pathsep + existing if existing else "")
@@ -198,6 +236,7 @@ class UISession:
     if not _is_built(self.root):
       raise UISessionError(f"{self.root} is not built (no msgq ipc_pyx); run `scons -j$(nproc)` there or pass root=")
     self.stop(quiet=True)
+    self.ensure_prefix()
 
     self.mode = mode
     if instant_onroad is not None:
@@ -306,6 +345,7 @@ class UISession:
       "display": self.display_name or None,
       "openpilot_root": str(self.root),
       "pkg_prefix": self.pkg_prefix or None,
+      "openpilot_prefix": self.prefix,
       "replay_running": self._replay is not None and self._replay.poll() is None,
       "publish_running": self._publisher is not None and self._publisher.poll() is None,
       "ui_log": self.ui_log or None,
@@ -420,6 +460,7 @@ class UISession:
     return log, shots
 
   def set_param(self, name: str, value: bool | int | float | str) -> str:
+    self.ensure_prefix()
     # put routes by the value's python type with no coercion, so pass it through as-is.
     # str(v) would break INT/FLOAT params. a bool uses put_bool to be explicit.
     # json carries the value so nan/inf survive, repr would emit bare NameError tokens
@@ -543,6 +584,26 @@ class UISession:
     alive = self._replay.poll() is None
     return {"replay_started": alive, "args": args, "replay_log": self.replay_log}
 
+  # copy the segments replay needs into a local dir once, so replay -d skips the route API lookup
+  # and the python downloader (streaming starts in ~0.3s instead of ~1.1s). returns the dir and
+  # the first cached segment, or None when the route string isn't a plain dongle/route
+  def cache_route(self, route: str, first_seg: int, dcam: bool, ecam: bool) -> Path | None:
+    m = re.fullmatch(r"([0-9a-f]{16})[/|]([0-9a-f]{8}--[0-9a-f]{10}|\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})", route)
+    if m is None:
+      return None
+    self.ensure_prefix()
+    cache_dir = ROUTE_CACHE / f"{m.group(1)}_{m.group(2)}"
+    wanted = ["fcamera.hevc"] + (["dcamera.hevc"] if dcam else []) + (["ecamera.hevc"] if ecam else [])
+    seg_dirs = [cache_dir / f"{m.group(2)}--{seg}" for seg in range(first_seg, first_seg + ROUTE_CACHE_SEGMENTS)]
+    have = all((d / f).exists() for d in seg_dirs for f in wanted) and all(any(d.glob("?log*")) for d in seg_dirs)
+    if not have:
+      cmd = [*self._python(), str(ROUTE_CACHE_SCRIPT), f"{m.group(1)}/{m.group(2)}", str(cache_dir), str(first_seg),
+             str(ROUTE_CACHE_SEGMENTS), *(["dcam"] if dcam else []), *(["ecam"] if ecam else [])]
+      res = subprocess.run(cmd, cwd=str(self.root), env=self._env(), capture_output=True, text=True, timeout=600)
+      if res.returncode != 0 or not (seg_dirs[0] / "fcamera.hevc").exists():
+        return None
+    return cache_dir
+
   # onroad shows the camera, so the screen changes every frame while offroad is static. without
   # instant onroad the UI holds offroad ~2.5s then scrolls over, so wait out the scroll too
   def wait_onroad(self, timeout: float = REPLAY_READY_TIMEOUT) -> bool:
@@ -623,6 +684,7 @@ class UISession:
       raise UISessionError(f"{self.root} is not built (no msgq ipc_pyx); run `scons -j$(nproc)` there")
     if route and (start is None or end is None) and route.count("/") != 3:
       raise UISessionError("pass start and end (seconds) with a route, or route as dongle/route/start/end")
+    self.ensure_prefix()
 
     clip_args = [route] if route else ["--demo"]
     if start is not None:
@@ -886,7 +948,7 @@ def clear_alerts() -> list:
 
 @mcp.tool()
 def start_replay(route: str = "", dcam: bool = False, ecam: bool = False, start: int | None = None,
-                 speed: float = 1.0, wait: bool = True) -> list:
+                 speed: float = 1.0, wait: bool = True, local: bool = True) -> list:
   """Replay a route so the onroad UI shows real data. Empty route uses --demo.
 
   Start the UI first; replay shares its msgq. dcam/ecam load driver/wide cameras.
@@ -894,6 +956,9 @@ def start_replay(route: str = "", dcam: bool = False, ecam: bool = False, start:
   it only engages ~20s in) and 0 for other routes. speed: playback speed multiplier.
   wait: block until the onroad camera is playing (about 5s, the UI itself holds offroad
   for ~2.5s) and return a screenshot, so no screenshot polling is needed.
+  local: replay from a local copy of the 3 segments from start (downloaded on first use,
+  then instant), so it starts ~1s faster and works offline. Playback then covers those 3
+  minutes. False streams the whole route from the server.
   For offline video or before/after comparisons use render_clip instead.
   """
   extra = []
@@ -903,6 +968,12 @@ def start_replay(route: str = "", dcam: bool = False, ecam: bool = False, start:
     extra.append("--ecam")
   if start is None and not route:
     start = DEMO_START
+  start = start or 0
+  cache_dir = SESSION.cache_route(route or DEMO_ROUTE, start // 60, dcam, ecam) if local else None
+  if cache_dir is not None:
+    # replay counts time from the first segment it finds in the dir
+    route, start = route or DEMO_ROUTE, start % 60
+    extra += ["-d", str(cache_dir)]
   if start:
     extra += ["-s", str(start)]
   if speed != 1.0:
@@ -967,7 +1038,7 @@ def logs(lines: int = 40) -> str:
 def main() -> None:
   import atexit
   import sys
-  atexit.register(lambda: SESSION.stop(quiet=True))
+  atexit.register(lambda: (SESSION.stop(quiet=True), SESSION.cleanup_prefix()))
 
   def _on_signal(*_):
     SESSION.stop(quiet=True)

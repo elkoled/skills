@@ -41,7 +41,9 @@ screenshot in the tool result, so you see the effect of each action immediately.
    data; `stop_replay` when done. `stop_ui` frees everything.
 
 `start_replay` blocks until the onroad camera is playing (about 2s) and returns a screenshot,
-so don't poll with `screenshot`. The UI is launched with instant onroad: it skips the device's
+so don't poll with `screenshot`. By default it replays a local copy of the 3 segments from
+`start` (downloaded to `/tmp/op_ui_mcp_routes` on first use), which skips the route API lookup
+and starts in ~1.2s. `local=False` streams the whole route from the server instead. The UI is launched with instant onroad: it skips the device's
 ~2.5s offroad hold and scroll into onroad. Pass `instant_onroad=False` to `start_ui` when
 testing that transition itself. Pass `start`
 seconds to jump into a route and `speed` to play faster.
@@ -64,6 +66,10 @@ y down. Small UI is 536x240, big UI is 2160x1080. The display is sized to the UI
 scaled 1:1, so a point in the screenshot is the point you pass.
 
 ## Behavior to know
+
+- Each server process runs the UI, replay and publishers under its own `OPENPILOT_PREFIX`
+  (`status` shows it), so concurrent sessions don't collide on msgq. Params start as a copy of
+  the default `~/.comma/params` and are removed when the server exits.
 
 - The home screen is one big button: tapping almost anywhere opens Settings.
 - `show_touches=True` draws a red dot and trail where touches land, plus red debug outlines
