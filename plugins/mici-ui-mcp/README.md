@@ -38,7 +38,7 @@ not built. Both the flat layout and the nested one (source under
 
 | tool | what it does |
 |------|--------------|
-| `start_ui(mode, show_touches, show_fps, root?)` | launch the UI (`mode` = `small` 536x240 or `big` 2160x1080), optionally pointing at another checkout via `root`. Returns a screenshot. |
+| `start_ui(mode, show_touches, show_fps, root?, instant_onroad?)` | launch the UI (`mode` = `small` 536x240 or `big` 2160x1080), optionally pointing at another checkout via `root`. `instant_onroad` (default on) skips the device's ~2.5s offroad hold before onroad. Returns a screenshot. |
 | `restart_ui(mode?)` | stop and relaunch to pick up code changes |
 | `stop_ui()` | tear down UI, replay and the display |
 | `screenshot()` | capture the current screen as a PNG |
@@ -51,7 +51,7 @@ not built. Both the flat layout and the nested one (source under
 | `stop_publish()` | stop a background publisher |
 | `go_offroad()` | drop the UI to the home page (publishes `deviceState.started=False`) so settings is reachable after a replay |
 | `clear_alerts()` | clear a sticky onroad alert left on screen after a publish |
-| `start_replay(route, dcam?, ecam?, start?, speed?, wait?)` | replay a route (empty = demo route, from 90s where it is engaged) into the running UI. Waits until the onroad camera plays (~5s) and returns a screenshot |
+| `start_replay(route, dcam?, ecam?, start?, speed?, wait?)` | replay a route (empty = demo route, from 90s where it is engaged) into the running UI. Waits until the onroad camera plays (~2s) and returns a screenshot |
 | `stop_replay()` | stop replay |
 | `render_clip(route?, start?, end?, compare_ref?, big?, qcam?, overlays?, output?)` | render the onroad UI over a route to an mp4 offline, faster than realtime, via `tools/clip/run.py`, always with streaming decode and a frame clock (patched in by `clip_runner.py` when the checkout lacks them). `compare_ref` renders that git ref's UI on top and the working tree below, in parallel. Returns the path and a middle-frame preview |
 | `status()` / `logs(lines?)` | session state / tail the UI log |

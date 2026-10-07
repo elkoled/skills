@@ -39,6 +39,7 @@ SIZES = {
 }
 
 UI_READY_TIMEOUT = 40.0
+UI_RUNNER = Path(__file__).resolve().parent / "ui_runner.py"
 # after an input, poll until the screen holds still instead of sleeping a fixed time.
 # a moving camera (replay) never holds still, so that case ends at SETTLE_MAX
 SETTLE_MIN = 0.08
@@ -46,7 +47,7 @@ SETTLE_STABLE = 0.1
 SETTLE_MAX = 0.5
 SWIPE_STEPS = 24
 REPLAY_READY_TIMEOUT = 40.0
-ONROAD_MOTION = 1.5  # seconds of continuous change that only a playing camera produces
+ONROAD_MOTION = 0.3  # seconds of continuous change, with instant onroad only a playing camera does that
 DEMO_START = 90  # the demo route is engaged and moving here, it only engages ~20s in
 
 CLIP_DIR = Path("/tmp/op_ui_mcp_clips")
@@ -108,6 +109,7 @@ class UISession:
     self.root = root
     self.pkg_prefix = _pkg_prefix(root) or ""
     self.mode = "small"
+    self.instant_onroad = True
     self.width = 0
     self.height = 0
     self.display_num: int | None = None
@@ -186,7 +188,7 @@ class UISession:
     raise UISessionError(f"X server {name} did not come up: {last}")
 
   def start(self, mode: str = "small", show_touches: bool = False,
-            show_fps: bool = False, extra_env: dict | None = None) -> dict:
+            show_fps: bool = False, extra_env: dict | None = None, instant_onroad: bool | None = None) -> dict:
     if mode not in SIZES:
       raise UISessionError(f"unknown mode {mode!r}; use one of {list(SIZES)}")
     if self.is_running():
@@ -198,6 +200,8 @@ class UISession:
     self.stop(quiet=True)
 
     self.mode = mode
+    if instant_onroad is not None:
+      self.instant_onroad = instant_onroad
     self.width, self.height = SIZES[mode]
     self.display_num = self._free_display()
     self.display_name = f":{self.display_num}"
@@ -222,6 +226,7 @@ class UISession:
         "SHOW_TOUCHES": "1" if show_touches else "0",
         "SHOW_FPS": "1" if show_fps else "0",
         "QT_QPA_PLATFORM": "offscreen",
+        "OP_UI_MCP_INSTANT_ONROAD": "1" if self.instant_onroad else "0",
       })
       if extra_env:
         env.update({str(k): str(v) for k, v in extra_env.items()})
@@ -229,7 +234,7 @@ class UISession:
       self.ui_log = f"/tmp/op_ui_mcp_ui{self.display_num}.log"
       with open(self.ui_log, "w") as ui_log_f:
         self._ui = subprocess.Popen(
-          [*self._python(), self._rel("selfdrive", "ui", "ui.py")],
+          [*self._python(), str(UI_RUNNER), self._rel("selfdrive", "ui", "ui.py")],
           cwd=str(self.root), env=env,
           stdout=ui_log_f, stderr=subprocess.STDOUT,
           start_new_session=True,
@@ -296,6 +301,7 @@ class UISession:
     return {
       "running": self.is_running(),
       "mode": self.mode,
+      "instant_onroad": self.instant_onroad,
       "resolution": f"{self.width}x{self.height}" if self.width else None,
       "display": self.display_name or None,
       "openpilot_root": str(self.root),
@@ -533,12 +539,12 @@ class UISession:
       self._replay = subprocess.Popen(args, cwd=str(self.root), env=env,
                                       stdout=log_f, stderr=subprocess.STDOUT,
                                       stdin=subprocess.DEVNULL, start_new_session=True)
-    time.sleep(0.3)
+    time.sleep(0.1)
     alive = self._replay.poll() is None
     return {"replay_started": alive, "args": args, "replay_log": self.replay_log}
 
-  # onroad shows the camera, so the screen changes every frame. offroad is static, and the
-  # scroll into onroad (after the UI's own ~2.5s ONROAD_DELAY) moves for under a second
+  # onroad shows the camera, so the screen changes every frame while offroad is static. without
+  # instant onroad the UI holds offroad ~2.5s then scrolls over, so wait out the scroll too
   def wait_onroad(self, timeout: float = REPLAY_READY_TIMEOUT) -> bool:
     start = time.monotonic()
     prev = self._grab().tobytes()
@@ -550,7 +556,7 @@ class UISession:
       cur = self._grab().tobytes()
       if cur != prev:
         moving_since = moving_since or time.monotonic()
-        if time.monotonic() - moving_since >= ONROAD_MOTION:
+        if time.monotonic() - moving_since >= (ONROAD_MOTION if self.instant_onroad else 1.5):
           return True
       else:
         moving_since = None
@@ -711,17 +717,19 @@ mcp = MCPServer(
 
 @mcp.tool()
 def start_ui(mode: str = "small", show_touches: bool = False, show_fps: bool = False,
-             root: str | None = None) -> list:
+             root: str | None = None, instant_onroad: bool = True) -> list:
   """Launch the openpilot UI on a private headless display and return a screenshot.
 
   mode: 'small' (536x240, comma four/mici layout) or 'big' (2160x1080, tici layout).
   show_touches: draw a red dot + trail at injected touches plus red debug outlines on every widget. off by default so screenshots show the real UI.
   root: point at a different checkout for this and later calls (defaults to $OPENPILOT_ROOT).
+  instant_onroad: go onroad as soon as replay starts (default). False keeps the device's ~2.5s
+  offroad hold and scroll animation, for testing that transition.
   Idempotent-ish: errors if a UI is already running (use restart_ui to reload code).
   """
   if root:
     SESSION.set_root(root)
-  status = SESSION.start(mode=mode, show_touches=show_touches, show_fps=show_fps)
+  status = SESSION.start(mode=mode, show_touches=show_touches, show_fps=show_fps, instant_onroad=instant_onroad)
   out: list = [f"started: {status}"]
   if SESSION.is_running():
     out.append(_img(SESSION.screenshot()))
@@ -904,7 +912,7 @@ def start_replay(route: str = "", dcam: bool = False, ecam: bool = False, start:
   if wait and status["replay_started"]:
     if not SESSION.wait_onroad():
       out.append(f"onroad camera not playing after {REPLAY_READY_TIMEOUT}s; see {SESSION.replay_log}")
-    out.append(_img(SESSION.settled_screenshot()))
+    out.append(_img(SESSION.screenshot()))
   return out
 
 
