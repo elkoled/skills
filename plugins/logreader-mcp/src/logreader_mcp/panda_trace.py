@@ -35,7 +35,7 @@ int set_safety_hooks(uint16_t mode, uint16_t param);
 void set_controls_allowed(bool c);
 void set_alternative_experience(int mode);
 void set_timer(uint32_t t);
-void safety_tick_current_safety_config(void);
+void safety_tick(void);
 void init_tests(void);
 void op_gcov_reset(void);
 void op_gcov_dump(void);

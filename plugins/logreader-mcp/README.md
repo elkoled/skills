@@ -52,13 +52,28 @@ works: comma-connect route names (using your `~/.comma/auth.json` token),
 ```
 
 That registers an MCP server named `logreader` whose command is `run.sh`. The
-wrapper launches the server inside openpilot's uv environment so the compiled
-`cereal`/`opendbc`/`libsafety` extensions resolve:
+wrapper runs the server on the checkout's own `.venv` python, so the compiled
+`cereal`/`opendbc` extensions resolve, with `mcp` layered on top. It never syncs
+the checkout's venv or touches its `uv.lock`:
 
 ```bash
 ROOT="${OPENPILOT_ROOT:-$HOME/openpilot}"
-exec uv run --project "$ROOT" --with "mcp,numpy" python "$DIR/run_server.py"
+exec uv run --quiet --no-project --python "$ROOT/.venv/bin/python" --with "mcp>=2.3,<3" python "$DIR/run_server.py"
 ```
+
+Both checkout layouts work (source at the repo root, or nested under `openpilot/`).
+
+## Speed
+- `load_route` scans all segments in parallel worker processes and keeps only each
+  message's service, time and byte offset. Messages of a service are built only when
+  a tool asks for that service, fields are read straight off them.
+- The CAN index is built in parallel as numpy arrays over one data buffer, warmed in
+  the background after `load_route`.
+- `panda_replay` runs the whole frame array through an `-O2` libsafety in one C loop.
+- Everything is sorted by time, segments are not assumed to arrive in order.
+
+On a 16 segment route: `load_route` ~1.5s, `health_scan` <1s, CAN index ~2s,
+`panda_blocked_messages` <0.1s, `panda_replay` ~1s (was ~60s, 10s, n/a, 150s, broken).
 
 If your openpilot checkout is not at `~/openpilot`, set `OPENPILOT_ROOT` in your
 environment before launching Claude Code.

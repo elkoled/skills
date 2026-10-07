@@ -5,25 +5,25 @@ from pathlib import Path
 _BOOTSTRAPPED = False
 
 
+# the nested layout keeps the source under openpilot/, the flat one at the repo root
+def _is_checkout(root: Path) -> bool:
+  return any((root / prefix / "tools" / "lib" / "logreader.py").exists() for prefix in ("openpilot", ""))
+
+
 def _candidate_roots():
   env = os.environ.get("OPENPILOT_ROOT")
   if env:
     yield Path(env).expanduser()
+  for start in (Path.cwd(), Path(__file__).resolve()):
+    yield from (start, *start.parents)
   yield Path.home() / "openpilot"
-  here = Path(__file__).resolve()
-  for parent in here.parents:
-    if (parent / "openpilot" / "__init__.py").exists() or (parent / "tools" / "lib" / "logreader.py").exists():
-      yield parent
 
 
 def find_openpilot_root() -> Path:
   for root in _candidate_roots():
-    if (root / "tools" / "lib" / "logreader.py").exists():
-      return root
-  raise RuntimeError(
-    "Could not find an openpilot checkout. Set OPENPILOT_ROOT to its path "
-    "(the dir containing tools/lib/logreader.py)."
-  )
+    if _is_checkout(root):
+      return root.resolve()
+  raise RuntimeError("Could not find an openpilot checkout. Set OPENPILOT_ROOT to its path.")
 
 
 def bootstrap() -> Path:

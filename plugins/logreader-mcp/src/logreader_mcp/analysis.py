@@ -42,24 +42,22 @@ def list_services(rd: RouteData) -> dict[str, Any]:
 
 
 def list_fields(rd: RouteData, service: str) -> dict[str, Any]:
-  ts = rd.time_series
-  if service not in ts:
-    return {"error": f"service '{service}' not in route", "available": sorted(ts.keys())[:60]}
-  fields = [k for k in ts[service].keys() if k != "t"]
-  return {"service": service, "n_samples": len(ts[service]["t"]), "fields": sorted(fields)}
+  counts = rd.service_counts
+  if service not in counts:
+    return {"error": f"service '{service}' not in route", "available": sorted(counts)[:60]}
+  return {"service": service, "n_samples": counts[service], "fields": sorted(rd.field_names(service))}
 
 
 def _scalar_series(rd: RouteData, service: str, field: str,
                    t_start: float | None = None, t_end: float | None = None):
-  ts = rd.time_series
-  if service not in ts:
-    return None, None, {"error": f"service '{service}' not found", "available": sorted(ts.keys())[:60]}
-  group = ts[service]
-  if field not in group:
-    return None, None, {"error": f"field '{field}' not in '{service}'",
-                        "available": sorted(k for k in group if k != "t")}
-  t = np.asarray(group["t"], dtype=float)
-  v = np.asarray(group[field])
+  counts = rd.service_counts
+  if service not in counts:
+    return None, None, {"error": f"service '{service}' not found", "available": sorted(counts)[:60]}
+  try:
+    v = rd.field(service, field)
+  except (AttributeError, KeyError, IndexError):
+    return None, None, {"error": f"field '{field}' not in '{service}'", "available": sorted(rd.field_names(service))}
+  t = rd.times(service)
   if t_start is not None:
     m = t >= t_start
     t, v = t[m], v[m]
@@ -125,26 +123,22 @@ def can_summary(rd: RouteData, stream: str = "can", bus: int | None = None) -> d
   idx = rd.can if stream == "can" else rd.sendcan
   if len(idx) == 0:
     return {"stream": stream, "n_frames": 0, "addresses": []}
-  agg: dict[tuple[int, int], dict[str, Any]] = {}
-  seen_t0 = seen_t1 = None
-  for t, a, b, d in zip(idx.t_ns, idx.addr, idx.bus, idx.dat):
-    if bus is not None and b != bus:
-      continue
-    seen_t0 = t if seen_t0 is None else seen_t0
-    seen_t1 = t
-    k = (b, a)
-    e = agg.get(k)
-    if e is None:
-      e = agg[k] = {"bus": b, "address": a, "address_hex": hex(a), "count": 0, "dlc": len(d)}
-    e["count"] += 1
-    e["dlc"] = max(e["dlc"], len(d))
-  dur = ((seen_t1 - seen_t0) / 1e9) if seen_t0 is not None and seen_t1 > seen_t0 else 1.0
-  rows = []
-  for e in agg.values():
-    e["avg_hz"] = round(e["count"] / dur, 2)
-    rows.append(e)
-  rows.sort(key=lambda r: (r["bus"], r["address"]))
-  return {"stream": stream, "n_frames": len(idx), "duration_s": round(dur, 2),
+  n_frames = len(idx)
+  if bus is not None:
+    idx = idx.select(idx.bus == bus)
+  if len(idx) == 0:
+    return {"stream": stream, "n_frames": 0, "addresses": []}
+  dur = (idx.t_ns[-1] - idx.t_ns[0]) / 1e9 if idx.t_ns[-1] > idx.t_ns[0] else 1.0
+  # one int64 key per frame, sorted once, then per-key counts and max length by run boundaries
+  key = (idx.bus << 32) | idx.addr
+  order = np.argsort(key, kind="stable")
+  skey = key[order]
+  starts = np.flatnonzero(np.r_[True, skey[1:] != skey[:-1]])
+  cnt = np.diff(np.r_[starts, len(skey)])
+  dlc = np.maximum.reduceat(idx.ln[order], starts)
+  rows = [{"bus": int(k >> 32), "address": int(k & 0xFFFFFFFF), "address_hex": hex(int(k & 0xFFFFFFFF)), "count": int(c),
+           "dlc": int(d), "avg_hz": round(int(c) / dur, 2)} for k, c, d in zip(skey[starts], cnt, dlc, strict=True)]
+  return {"stream": stream, "n_frames": n_frames, "duration_s": round(dur, 2),
           "n_addresses": len(rows), "addresses": rows}
 
 
@@ -156,12 +150,12 @@ def decode_signal(rd: RouteData, address: int, signal: str, bus: int = 0,
     fp, plat = _platform(rd)
     if plat is None:
       return {"error": "no DBC: car platform unknown, pass dbc_name explicitly"}
-    from opendbc.car.values import Bus
+    from opendbc.car import Bus
     dd = plat.config.dbc_dict
     dbc_name = dd.get(Bus.pt) or next(iter(dd.values()))
   idx = rd.can if stream == "can" else rd.sendcan
-  frames = [(t, d) for t, a, b, d in zip(idx.t_ns, idx.addr, idx.bus, idx.dat)
-            if a == address and b == bus]
+  sel = idx.select((idx.addr == address) & (idx.bus == bus))
+  frames = list(zip(sel.t_ns.tolist(), sel.dat, strict=True))
   if not frames:
     return {"error": f"no frames for addr {hex(address)} on bus {bus} in '{stream}'"}
   try:
@@ -190,16 +184,18 @@ def decode_signal(rd: RouteData, address: int, signal: str, bus: int = 0,
 
 def changing_bits(rd: RouteData, address: int, bus: int = 0, stream: str = "can") -> dict[str, Any]:
   idx = rd.can if stream == "can" else rd.sendcan
-  dats = [d for a, b, d in zip(idx.addr, idx.bus, idx.dat) if a == address and b == bus]
+  dats = idx.select((idx.addr == address) & (idx.bus == bus)).dat
   if not dats:
     return {"error": f"no frames for addr {hex(address)} on bus {bus}"}
   maxlen = max(len(d) for d in dats)
   ever_one = bytearray(maxlen)
   ever_zero = bytearray(maxlen)
-  for d in dats:
-    for i in range(len(d)):
-      ever_one[i] |= d[i]
-      ever_zero[i] |= (~d[i]) & 0xFF
+  for n in sorted({len(d) for d in dats}):
+    arr = np.frombuffer(b"".join(d for d in dats if len(d) == n), dtype=np.uint8).reshape(-1, n)
+    ones, zeros = np.bitwise_or.reduce(arr, axis=0), np.bitwise_or.reduce(~arr, axis=0)
+    for i in range(n):
+      ever_one[i] |= int(ones[i])
+      ever_zero[i] |= int(zeros[i])
   changing = []
   for byte_i in range(maxlen):
     toggling = ever_one[byte_i] & ever_zero[byte_i]
@@ -213,13 +209,7 @@ def changing_bits(rd: RouteData, address: int, bus: int = 0, stream: str = "can"
 def events_timeline(rd: RouteData, max_events: int = 500) -> dict[str, Any]:
   out = []
   t0 = None
-  for msg in rd.lr:
-    try:
-      w = msg.which()
-    except Exception:
-      continue
-    if w != "onroadEvents":
-      continue
+  for msg in rd.msgs("onroadEvents"):
     t = msg.logMonoTime / 1e9
     if t0 is None:
       t0 = t
@@ -241,24 +231,23 @@ def events_timeline(rd: RouteData, max_events: int = 500) -> dict[str, Any]:
 
 
 def engagement_summary(rd: RouteData) -> dict[str, Any]:
-  ts = rd.time_series
+  counts = rd.service_counts
   field = None
   for cand_svc in ("selfdriveState", "controlsState"):
-    g = ts.get(cand_svc)
-    if not g:
+    if cand_svc not in counts:
       continue
+    names = rd.field_names(cand_svc)
     for cand_field in ("enabled", "deprecated/enabled"):
-      if cand_field in g:
+      if cand_field in names:
         svc, field = cand_svc, cand_field
         break
     if field:
       break
   if field is None:
-    avail = {s: sorted(k for k in ts[s] if k != "t") for s in ("selfdriveState", "controlsState") if s in ts}
+    avail = {s: sorted(rd.field_names(s)) for s in ("selfdriveState", "controlsState") if s in counts}
     return {"error": "no enabled field in selfdriveState/controlsState", "available": avail}
-  g = ts[svc]
-  t = np.asarray(g["t"], dtype=float)
-  en = np.asarray(g[field]).astype(bool)
+  t = rd.times(svc)
+  en = rd.field(svc, field).astype(bool)
   trans = np.diff(en.astype(int))
   engage_t = t[1:][trans == 1]
   diseng_t = t[1:][trans == -1]
@@ -284,7 +273,6 @@ EXPECTED_HZ = {
 
 
 def health_scan(rd: RouteData) -> dict[str, Any]:
-  ts = rd.time_series
   dur = rd.duration_s() or 1.0
   findings = []
   for svc, exp in EXPECTED_HZ.items():
@@ -293,28 +281,27 @@ def health_scan(rd: RouteData) -> dict[str, Any]:
       if hz < exp * 0.7:
         findings.append({"kind": "low_rate", "service": svc,
                          "expected_hz": exp, "actual_hz": round(hz, 1)})
-    g = ts.get(svc)
-    if g is not None:
-      t = np.asarray(g["t"], dtype=float)
+    if svc in rd.service_counts:
+      t = rd.times(svc)
       if len(t) > 1:
         gap = float(np.max(np.diff(t)))
         if gap > max(0.5, 5.0 / exp):
           findings.append({"kind": "gap", "service": svc, "max_gap_s": round(gap, 3)})
   for svc, fields in {"carState": ["vEgo", "aEgo", "steeringAngleDeg"],
                       "controlsState": ["curvature"], "liveLocationKalman": []}.items():
-    g = ts.get(svc)
-    if not g:
+    if svc not in rd.service_counts:
       continue
+    names = rd.field_names(svc)
     for f in fields:
-      if f in g:
+      if f in names:
         try:
-          v = np.asarray(g[f], dtype=float)
+          v = rd.field(svc, f).astype(float)
         except (TypeError, ValueError):
           continue
         nn = int(np.sum(~np.isfinite(v)))
         if nn:
           findings.append({"kind": "nan", "service": svc, "field": f, "count": nn})
-  if "can" in rd.service_counts and len(rd.can) == 0:
+  if "can" in rd.service_counts and not any(len(m.can) for m in rd.msgs("can")):
     findings.append({"kind": "no_can_frames"})
   cp = rd.car_params
   meta = {}

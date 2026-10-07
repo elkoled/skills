@@ -2,4 +2,6 @@
 set -euo pipefail
 ROOT="${OPENPILOT_ROOT:-$HOME/openpilot}"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec uv run --project "$ROOT" --with "mcp,numpy" python "$DIR/run_server.py"
+# the checkout's own venv (compiled cereal/opendbc) with mcp layered on top. uv run --project
+# would sync that venv and rewrite its uv.lock on every launch
+exec uv run --quiet --no-project --python "$ROOT/.venv/bin/python" --with "mcp>=2.3,<3" python "$DIR/run_server.py"

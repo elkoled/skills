@@ -1,17 +1,29 @@
 from __future__ import annotations
 
+import threading
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from . import analysis, panda
 from .route_cache import clear_cache, get_route
 
-mcp = FastMCP("logreader")
+mcp = MCPServer(
+  "logreader",
+  instructions=(
+    "Analyze openpilot routes: cereal fields, CAN/DBC, events, engagement, an anomaly scan and a panda "
+    "safety debugger. Call load_route once, later tools reuse the parsed route from memory."
+  ),
+)
 
 
+# ToolError so the client sees the message, mcp 2 hides other exceptions
 def _rd(route: str, mode: str = "r"):
-  return get_route(route, mode)
+  try:
+    return get_route(route, mode)
+  except Exception as e:
+    raise ToolError(f"could not load route {route!r}: {e}") from e
 
 
 @mcp.tool()
@@ -25,6 +37,9 @@ def load_route(route: str, mode: str = "r") -> dict[str, Any]:
   rd = _rd(route, mode)
   cp = rd.car_params
   svc = analysis.list_services(rd)
+  # warm the CAN index in the background, CAN and panda tools then usually find it ready
+  if "can" in rd.service_counts:
+    threading.Thread(target=lambda: rd.can, daemon=True).start()
   return {
     "route": route,
     "car": cp.carFingerprint if cp is not None else None,
