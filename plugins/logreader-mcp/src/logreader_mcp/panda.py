@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .bootstrap import bootstrap
+from . import replay_shim
 from .route_cache import RouteData
 
 bootstrap()
@@ -19,71 +20,29 @@ from opendbc.safety.tests.libsafety import libsafety_py as LS  # noqa: E402
 
 _LIB = None
 
-# safety.c plus a loop that feeds a whole frame array through the hooks, so replay doesn't pay a
-# python -> cffi round trip per frame. mirrors the python loop: timer, 10ms safety_tick, rx/tx hook
-REPLAY_C = r"""
-#include "opendbc/safety/tests/libsafety/safety.c"
-
-static unsigned char len_to_dlc(int len) {
-  static const int lens[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64};
-  for (int i = 0; i < 16; i++) {
-    if (lens[i] >= len) return (unsigned char)i;
-  }
-  return 15;
-}
-
-long replay_frames(long n, const long *t_ns, const long *kind, const long *addr, const long *bus, const long *off,
-                   const long *len, const unsigned char *buf, long t0, long start_rel, long end_rel, long *last_tick,
-                   unsigned char *ok) {
-  for (long i = 0; i < n; i++) {
-    long rel = t_ns[i] - t0;
-    if (rel < start_rel) continue;
-    if (rel > end_rel) return i;
-    set_timer((uint32_t)(rel / 1000));
-    if (t_ns[i] - *last_tick > 10000000) {
-      safety_tick();
-      *last_tick = t_ns[i];
-    }
-    CANPacket_t pkt = {0};
-    pkt.extended = addr[i] >= 0x800;
-    pkt.addr = (uint32_t)addr[i];
-    pkt.bus = (unsigned char)bus[i];
-    pkt.data_len_code = len_to_dlc((int)len[i]);
-    for (long j = 0; j < len[i]; j++) pkt.data[j] = buf[off[i] + j];
-    if (kind[i] == 0) {
-      safety_rx_hook(&pkt);
-    } else {
-      ok[i] = safety_tx_hook(&pkt);
-    }
-  }
-  return n;
-}
-"""
-
-REPLAY_CDEF = """
+LIB_CDEF = """
 void init_tests(void);
 int set_safety_hooks(uint16_t mode, uint16_t param);
 void set_alternative_experience(int mode);
-long replay_frames(long n, const long *t_ns, const long *kind, const long *addr, const long *bus, const long *off,
-                   const long *len, const unsigned char *buf, long t0, long start_rel, long end_rel, long *last_tick,
-                   unsigned char *ok);
-"""
+""" + replay_shim.CDEF
 
 
-# optimized build in a temp dir. libsafety_py builds -O0 with UBSan and leaves its object
-# file inside the opendbc tree
+# -O2 safety.c plus the replay loop, built in a temp dir. libsafety_py builds -O0 with UBSan and
+# leaves its object file inside the opendbc tree
 def _libsafety():
   global _LIB
   if _LIB is None:
     from cffi import FFI
-    include_root = Path(LS.libsafety_dir).parents[3]
+    libdir = Path(LS.libsafety_dir)
+    include_root = libdir.parents[3]
     build = Path(tempfile.mkdtemp(prefix="logreader_mcp_safety_"))
-    src, so = build / "replay.c", build / "libreplay.so"
-    src.write_text(REPLAY_C)
-    subprocess.check_call(["cc", "-fPIC", "-shared", "-O2", "-std=gnu11", "-nostdlib", "-fno-builtin", "-DALLOW_DEBUG",
-                           "-I", str(include_root), str(src), "-o", str(so)])
+    obj, so = build / "safety.o", build / "libreplay.so"
+    subprocess.check_call(["cc", "-fPIC", "-O2", "-std=gnu11", "-nostdlib", "-fno-builtin", "-DALLOW_DEBUG",
+                           "-I", str(include_root), "-c", str(libdir / "safety.c"), "-o", str(obj)])
+    shim = replay_shim.build_object(build, include_root)
+    subprocess.check_call(["cc", "-shared", str(obj), str(shim), "-o", str(so)])
     ffi = FFI()
-    ffi.cdef(REPLAY_CDEF)
+    ffi.cdef(LIB_CDEF)
     _LIB = (ffi, ffi.dlopen(str(so)))
     shutil.rmtree(build, ignore_errors=True)
   return _LIB
@@ -135,11 +94,8 @@ def _merged(rd: RouteData) -> dict[str, Any]:
   return out
 
 
-def _interleave(rd: RouteData):
-  m = _merged(rd)
-  buf = m["buf"]
-  return [(t, k, a, b, buf[o:o + n]) for t, k, a, b, o, n in
-          zip(*(m[c].tolist() for c in ("t", "kind", "addr", "bus", "off", "len")), strict=True)]
+def _window(t_start: float | None, t_end: float | None) -> tuple[int, int]:
+  return (int(t_start * 1e9) if t_start is not None else -(1 << 62), int(t_end * 1e9) if t_end is not None else (1 << 62))
 
 
 def replay(rd: RouteData, t_start: float | None = None, t_end: float | None = None) -> dict[str, Any]:
@@ -158,13 +114,10 @@ def replay(rd: RouteData, t_start: float | None = None, t_end: float | None = No
   n = len(m["t"])
   if not n:
     return {"error": "no can/sendcan frames in route"}
-  t0 = int(m["t"][0])
+  frames = replay_shim.Frames(ffi, m)
+  t0 = frames.t0
   ok = np.full(n, 2, dtype=np.uint8)  # 2 = not run (rx, or outside the window)
-  last_tick = ffi.new("long *", 0)
-  ptr = {k: ffi.cast("long *", ffi.from_buffer(m[k])) for k in ("t", "kind", "addr", "bus", "off", "len")}
-  lib.replay_frames(n, ptr["t"], ptr["kind"], ptr["addr"], ptr["bus"], ptr["off"], ptr["len"], ffi.from_buffer(m["buf"]), t0,
-                    int(t_start * 1e9) if t_start is not None else -(1 << 62),
-                    int(t_end * 1e9) if t_end is not None else (1 << 62), last_tick, ffi.from_buffer(ok))
+  frames.run(lib, 0, n, *_window(t_start, t_end), True, ffi.cast("unsigned char *", ffi.from_buffer(ok)))
 
   ran_tx = (m["kind"] == 1) & (ok != 2)
   blocked_i = np.flatnonzero(ran_tx & (ok == 0))
@@ -244,41 +197,44 @@ def root_cause(rd: RouteData, address: int | None = None, bus: int | None = None
             "safety": active}
   trace.setup(active["mode_int"], active["param"], cfg["alternativeExperience"])
 
-  events = _interleave(rd)
-  if not events:
+  m = _merged(rd)
+  if not len(m["t"]):
     return {"error": "no can/sendcan frames"}
-  t0 = events[0][0]
-  last_tick = 0
+  frames = replay_shim.Frames(trace.ffi, m)
+  t0 = frames.t0
+  start_rel, end_rel = _window(t_start, t_end)
+  no_ok = trace.ffi.new("unsigned char[]", len(m["t"]))  # unused, the C loop runs no tx hook here
+  # tx frames that may need a coverage sample. everything between them (rx hooks, timer and tick
+  # for every frame) runs in C, other tx frames get timer and tick but no tx hook, as before
+  cand = m["kind"] == 1
+  if address is not None:
+    cand &= m["addr"] == address
+  if bus is not None:
+    cand &= m["bus"] == bus
   blocked_cov: dict[tuple[int, int], dict] = {}
   allowed_cov: dict[tuple[int, int], dict] = {}
-  for t_ns, kind, addr, b, dat in events:
-    tsec = (t_ns - t0) / 1e9
-    if t_start is not None and tsec < t_start:
+  pos = 0
+  for i in np.flatnonzero(cand).tolist():
+    stop = frames.run(trace.lib, pos, i + 1, start_rel, end_rel, False, no_ok)
+    if stop <= i:
+      break  # past t_end
+    pos = i + 1
+    rel = int(m["t"][i]) - t0
+    if rel < start_rel:
       continue
-    if t_end is not None and tsec > t_end:
-      break
-    trace.set_timer((t_ns - t0) // 1000)
-    if t_ns - last_tick > 10_000_000:
-      trace.lib.safety_tick()
-      last_tick = t_ns
-    if kind == 0:
-      trace.rx(addr, b, dat)
-      continue
-    if address is not None and addr != address:
-      continue
-    if bus is not None and b != bus:
-      continue
-    k = (b, addr)
-    need_blocked = k not in blocked_cov
-    need_allowed = k not in allowed_cov
+    k = (int(m["bus"][i]), int(m["addr"][i]))
+    need_blocked, need_allowed = k not in blocked_cov, k not in allowed_cov
     if not (need_blocked or need_allowed):
       continue
+    o, n = int(m["off"][i]), int(m["len"][i])
+    dat = m["buf"][o:o + n]
     # tx_hook mutates rate-limit state, so use this call's verdict, never re-call
-    allowed, cov = trace.executed_lines(addr, b, dat)
+    allowed, cov = trace.executed_lines(k[1], k[0], dat, lambda a, nb=need_blocked, na=need_allowed: na if a else nb)
+    tsec = round(rel / 1e9, 3)
     if not allowed and need_blocked:
-      blocked_cov[k] = {"t": round(tsec, 3), "dat": dat.hex(), "cov": cov}
+      blocked_cov[k] = {"t": tsec, "dat": dat.hex(), "cov": cov}
     elif allowed and need_allowed:
-      allowed_cov[k] = {"t": round(tsec, 3), "dat": dat.hex(), "cov": cov}
+      allowed_cov[k] = {"t": tsec, "dat": dat.hex(), "cov": cov}
 
   results = []
   for k, info in list(blocked_cov.items())[:max_groups]:

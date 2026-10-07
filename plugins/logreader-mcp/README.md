@@ -70,10 +70,13 @@ Both checkout layouts work (source at the repo root, or nested under `openpilot/
 - The CAN index is built in parallel as numpy arrays over one data buffer, warmed in
   the background after `load_route`.
 - `panda_replay` runs the whole frame array through an `-O2` libsafety in one C loop.
+  `panda_root_cause` uses the same loop on the gcov build between the TX frames it
+  samples, and only dumps and parses coverage when that frame's verdict is still needed.
 - Everything is sorted by time, segments are not assumed to arrive in order.
 
 On a 16 segment route: `load_route` ~1.5s, `health_scan` <1s, CAN index ~2s,
-`panda_blocked_messages` <0.1s, `panda_replay` ~1s (was ~60s, 10s, n/a, 150s, broken).
+`panda_blocked_messages` <0.1s, `panda_replay` ~1s, `panda_root_cause` ~2s for the whole
+route (was ~60s, 10s, n/a, 150s, broken, broken).
 
 If your openpilot checkout is not at `~/openpilot`, set `OPENPILOT_ROOT` in your
 environment before launching Claude Code.

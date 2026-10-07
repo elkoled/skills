@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from . import replay_shim
 from .bootstrap import bootstrap
 
 bootstrap()
@@ -64,6 +65,7 @@ class SafetyTraceLib:
     self.reason = None
     self.ffi = FFI()
     self.ffi.cdef(_CDEF, packed=True)
+    self.ffi.cdef(replay_shim.CDEF)
     self.build = Path(tempfile.mkdtemp(prefix="safety_trace_"))
     self.safety_c, self.include_root, self.safety_dir = _safety_paths()
     self.gcov = os.environ.get("GCOV", "gcov")
@@ -88,7 +90,8 @@ class SafetyTraceLib:
                           stderr=subprocess.DEVNULL)
     subprocess.check_call(["cc", "-fPIC", "-O0", "-c", str(shim), "-o", str(shim_obj)],
                           stderr=subprocess.DEVNULL)
-    subprocess.check_call(["cc", "-shared", str(obj), str(shim_obj), "-o", str(so),
+    replay_obj = replay_shim.build_object(self.build, self.include_root)
+    subprocess.check_call(["cc", "-shared", str(obj), str(shim_obj), str(replay_obj), "-o", str(so),
                            "-fprofile-arcs", "-ftest-coverage"],
                           stderr=subprocess.DEVNULL)
 
@@ -139,9 +142,12 @@ class SafetyTraceLib:
         res[f.get("file", "")] = lines
     return res
 
-  def executed_lines(self, addr, bus, dat) -> tuple[bool, dict[str, dict[int, int]]]:
+  # runs the tx hook once. the gcov dump and parse (the slow part) only happen when want(verdict)
+  def executed_lines(self, addr, bus, dat, want=lambda allowed: True) -> tuple[bool, dict[str, dict[int, int]] | None]:
     self.lib.op_gcov_reset()
     allowed = bool(self.lib.safety_tx_hook(self._packet(addr, bus, dat)))
+    if not want(allowed):
+      return allowed, None
     self.lib.op_gcov_dump()
     cov = self._coverage()
     sdir = str(self.safety_dir)
