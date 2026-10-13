@@ -90,7 +90,7 @@ def _merged(rd: RouteData) -> dict[str, Any]:
   }
   order = np.lexsort((cols["kind"], cols["t"]))
   out = {k: np.ascontiguousarray(v[order], dtype=np.int64) for k, v in cols.items()}
-  out["buf"] = c.buf + s.buf
+  out["buf"] = c.buf[:] + s.buf[:]  # the buffers can be memory mapped
   return out
 
 

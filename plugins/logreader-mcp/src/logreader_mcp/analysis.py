@@ -331,7 +331,7 @@ def health_scan(rd: RouteData) -> dict[str, Any]:
         nn = int(np.sum(~np.isfinite(v)))
         if nn:
           findings.append({"kind": "nan", "service": svc, "field": f, "count": nn})
-  if "can" in rd.service_counts and not any(len(m.can) for m in rd.msgs("can")):
+  if "can" in rd.service_counts and not len(rd.can):
     findings.append({"kind": "no_can_frames"})
   cp = rd.car_params
   meta = {}

@@ -7,7 +7,9 @@ every blocked TX message.
 
 Routes are resolved through openpilot's own `LogReader`, so anything it accepts
 works: comma-connect route names (using your `~/.comma/auth.json` token),
-`connect.comma.ai` share URLs, `commaCarSegments` segments, and local rlog paths.
+`connect.comma.ai` share URLs, `commaCarSegments` segments, and local rlog paths. A local
+directory of segments works too (`<dir>/<n>/rlog.zst`, `<dir>/<route>--<n>/rlog.bz2`,
+`<dir>/<route>--<n>--rlog.bz2`).
 
 ## Tools
 
@@ -16,6 +18,8 @@ works: comma-connect route names (using your `~/.comma/auth.json` token),
 | `load_route` | Warm-load a route, return car + duration + top services |
 | `list_services` / `list_fields` | Enumerate cereal services and their fields. List-type services (`pandaStates`, `onroadEvents`) read their first element, prefix an index for others (`1/ignitionLine`) |
 | `get_field` / `summarize_field` | Time series / stats for any cereal scalar (e.g. `carState.vEgo`) |
+| `eval_expr` | A derived signal from a numpy expression over fields, with min/max and when: `modelV2.action.desiredCurvature * carState.vEgo**2`, `modelV2.laneLines[1].y[0]`, `deriv(carState.vEgo)`, `smooth(x, 0.5)`. Fields are sampled at the fastest referenced service's times |
+| `find_windows` | Time windows where a condition holds (`abs(modelV2.action.desiredCurvature * carState.vEgo**2) > 2`, `selfdriveState.state == 'overriding'`), merged, filtered by duration, padded, each with the peak and mean of an optional score expression. Times are seconds since route start, the same as `render_clip` in mici-ui-mcp |
 | `route_dbcs` | DBC names for the car, by bus |
 | `can_summary` | Per-address CAN traffic (count, dlc, rate) for `can` or `sendcan` |
 | `decode_signal` | Decode a DBC signal to a time series |
@@ -23,7 +27,7 @@ works: comma-connect route names (using your `~/.comma/auth.json` token),
 | `events_timeline` / `engagement_summary` | Alerts timeline and engage/disengage transitions |
 | `health_scan` | One call: low rates, gaps, NaNs, missing CAN, car metadata. Expected rates come from cereal's service list, divided by the qlog decimation for qlogs |
 | `compare_routes` | Same metrics on two routes side by side with deltas (engagement, health, rates, event counts, field stats), e.g. before/after a tune |
-| `plot_route` | PNG of cereal fields (`carState/vEgo`) and DBC signals (`can:0x415:VehYawNonLin_W_Rq@0`), one panel each or overlaid, optionally with a second route overlaid |
+| `plot_route` | PNG of cereal fields (`carState/vEgo`), expressions (`carState.vEgo * 3.6`) and DBC signals (`can:0x415:VehYawNonLin_W_Rq@0`), one panel each or overlaid, optionally with a second route overlaid |
 | `panda_safety_config` | Safety model(s) + param + alternativeExperience the route ran with |
 | `panda_blocked_messages` | **Hardware truth**: sendcan frames whose echo never hit the bus |
 | `panda_replay` | Replay sendcan through the real opendbc safety model; report blocked TX |
@@ -66,8 +70,16 @@ exec uv run --quiet --no-project --python "$ROOT/.venv/bin/python" --with "mcp>=
 Both checkout layouts work (source at the repo root, or nested under `openpilot/`).
 
 ## Speed
-- `load_route` scans all segments in parallel worker processes and keeps only each
-  message's service, time and byte offset. Messages of a service are built only when
+- Routes are cached on disk in `~/.cache/logreader_mcp` (`LOGREADER_MCP_CACHE`): each segment
+  decompressed and indexed, the merged route index, the CAN index and every field read. A route
+  that was loaded before, also by an earlier server, loads in about 10 ms instead of seconds, and
+  fields come back in a millisecond. The route to segment file listing is kept for a day. The cache
+  is trimmed least recently used first to `LOGREADER_MCP_CACHE_GB` (30 by default).
+- Expressions in `eval_expr` / `find_windows` / `plot_route` are parsed into a whitelisted numpy
+  expression, so derived signals need no custom script.
+- Tools are marked read only and idempotent (MCP tool annotations).
+- A first `load_route` scans all segments in parallel worker processes and keeps only each
+  message's service, time and byte offset, every segment is decompressed once. Messages of a service are built only when
   a tool asks for that service, fields are read straight off them.
 - The CAN index is built in parallel as numpy arrays over one data buffer, warmed in
   the background after `load_route`.

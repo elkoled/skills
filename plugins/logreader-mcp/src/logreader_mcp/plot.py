@@ -5,7 +5,7 @@ import re
 
 import numpy as np
 
-from . import analysis
+from . import analysis, expr
 from .route_cache import RouteData
 
 MAX_POINTS = 4000  # per line, more doesn't show at plot resolution
@@ -14,8 +14,9 @@ MAX_POINTS = 4000  # per line, more doesn't show at plot resolution
 _SIGNAL = re.compile(r"(can|sendcan):(0x[0-9a-fA-F]+|\d+):([\w.]+)(?:@(\d+))?(?:#([\w.]+))?")
 
 
-# one series: 'service/field/path' for cereal, or the can: syntax above for a DBC signal.
-# returns (t relative to route start, values, category names for enum fields) or an error string
+# one series: 'service/field/path' for cereal, the can: syntax above for a DBC signal, or an expression
+# over fields (see expr.py). returns (seconds since route start, values, category names for enum fields)
+# or an error string
 def series(rd: RouteData, spec: str) -> tuple[np.ndarray, np.ndarray, list[str] | None] | str:
   m = _SIGNAL.fullmatch(spec)
   if m:
@@ -24,23 +25,27 @@ def series(rd: RouteData, spec: str) -> tuple[np.ndarray, np.ndarray, list[str] 
     if isinstance(res, dict):
       return res["error"]
     t, v, _ = res
-    cats = None
-  else:
+    t = rd.route_time(t)
+  elif re.fullmatch(r"\w+(/\w+)+", spec):
     service, _, field = spec.partition("/")
-    if not field:
-      return f"'{spec}': use service/field (e.g. carState/vEgo) or can:0xADDR:SIGNAL[@bus]"
     t, v, err = analysis._scalar_series(rd, service, field)
     if err:
       return f"'{spec}': {err['error']}"
-    cats = None
+    t = rd.route_time(t)
+  else:
     try:
-      v = v.astype(float)
-    except (TypeError, ValueError):
-      # enums and strings plot as their category index, the names become y tick labels
-      cats = list(dict.fromkeys(v.tolist()))
-      code = {c: i for i, c in enumerate(cats)}
-      v = np.array([code[x] for x in v.tolist()], dtype=float)
-  return t - rd.span()[0], v, cats
+      t, v, _ = expr.evaluate(rd, spec)
+    except expr.ExprError as e:
+      return f"'{spec}': {e}"
+  cats = None
+  try:
+    v = v.astype(float)
+  except (TypeError, ValueError):
+    # enums and strings plot as their category index, the names become y tick labels
+    cats = list(dict.fromkeys(v.tolist()))
+    code = {c: i for i, c in enumerate(cats)}
+    v = np.array([code[x] for x in v.tolist()], dtype=float)
+  return t, v, cats
 
 
 def render(lines: list[tuple[str, str, np.ndarray, np.ndarray, list[str] | None]], t_start: float | None, t_end: float | None,
