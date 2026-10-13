@@ -30,7 +30,7 @@ SM_START = 2  # first SubMaster frame count of a worker
 # UI clock at the clip start. Pre-roll frames are negative, and a clock near 0 reads as fresh to timers
 # that start at 0 (the map's reconnect wait, set speed and chestnut fades), like a device that just booted
 CLOCK_START = 10.0
-PREROLL = 3 * FPS  # frames before a worker's slice: the UI's longest timers (set speed, chestnut fade) are 2.5s, then a fade
+PREROLL = 4 * FPS  # frames before a worker's slice: onroad starts on a 2 Hz deviceState, then the longest timers (set speed, chestnut fade) are 2.5s and a fade
 F_SETPIPE_SZ = 1031
 
 
@@ -162,10 +162,13 @@ def chunk_segment(mono):
 
 # ---- camera -----------------------------------------------------------------------------------
 
-def scan_camera(path: str):
+def scan_camera(path: str, hevc: bool = True):
   """The file, its parameter sets and (frame, byte offset) of each keyframe (comma cameras send parameter sets once)."""
   import numpy as np
   raw = read_file(path)
+  if not hevc:
+    # qcameras are h264 in mpegts, its packets can't be cut at keyframes, so a segment decodes whole (it's small)
+    return raw, b"", [(0, 0)]
   b = np.frombuffer(raw, dtype=np.uint8)
   i = np.flatnonzero((b[:-5] == 0) & (b[1:-4] == 0) & (b[2:-3] == 1))
   typ = (b[i + 3] >> 1) & 0x3f
@@ -385,7 +388,7 @@ def with_fresh_listing(fn):
 
 
 def decode_camera(args, tag: str, paths: list, seg_start: int, seg_end: int, cam_ranges, mode: str) -> dict:
-  scans = {seg: Background(scan_camera, paths[seg]) for seg in range(seg_start, seg_end)}
+  scans = {seg: Background(scan_camera, paths[seg], not args.qcam) for seg in range(seg_start, seg_end)}
   scans = {seg: bg.result() for seg, bg in scans.items()}
   w, h = probe_size(paths[seg_start], None if args.qcam else scans[seg_start][1])
   d = start_decode(tag, scans, cam_ranges, not args.qcam, mode)
@@ -397,9 +400,6 @@ def decode_camera(args, tag: str, paths: list, seg_start: int, seg_end: int, cam
 
 def road_camera(args, tag: str, seg_start: int, seg_end: int, cam_ranges, mode: str) -> dict:
   route = get_route(args)
-  if not args.qcam and not all(route.camera_paths()[seg_start:seg_end]):
-    # fcameras only upload on request, fall back to the qcamera devices always upload
-    args.qcam, mode = True, "cpu"
   return decode_camera(args, f"{tag}_road", route.qcamera_paths() if args.qcam else route.camera_paths(), seg_start, seg_end, cam_ranges, mode)
 
 
@@ -873,6 +873,15 @@ def main() -> None:
   prefix = os.environ.setdefault("OPENPILOT_PREFIX", "fastclip")
   os.makedirs(f"/dev/shm/msgq_{prefix}", exist_ok=True)
   seg_start, seg_end = args.start // 60, (args.end - 1) // 60 + 1
+  route = get_route(args)
+  if not args.map and not args.qcam and not all(route.camera_paths()[seg_start:seg_end]):
+    print("no fcamera for this clip, rendering the qcamera", flush=True)  # fcameras only upload on request
+    args.qcam = True
+  # a clip starting at a segment boundary pre-rolls from the end of the previous segment, when it has the files
+  if seg_start > 0 and (args.start - seg_start * 60) * FPS < PREROLL:
+    cams = route.qcamera_paths() if args.qcam else route.camera_paths()
+    if route.log_paths()[seg_start - 1] is not None and (args.map or cams[seg_start - 1] is not None):
+      seg_start -= 1
   nframes = (args.end - args.start) * FPS
 
   # worker 0 pre-rolls too, from earlier in the first segment when there is room
