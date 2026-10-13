@@ -24,6 +24,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -70,6 +71,7 @@ ROUTE_RE = r"([0-9a-f]{16})[/|]([0-9a-f]{8}--[0-9a-f]{10}|\d{4}-\d{2}-\d{2}--\d{
 UI_DIFF_FPS = 60
 OFFROAD_ALERT_REFRESH = 5.0  # REFRESH_INTERVAL in selfdrive/ui/mici/layouts/offroad_alerts.py
 UI_DIFF_GAP = 30  # changed frames closer than this belong to one screen
+RECORD_FPS = 30
 
 
 # a pip/venv ffmpeg on PATH can lack filters like pad, prefer the system build
@@ -155,6 +157,8 @@ class UISession:
     self._render_prefix_ready = False
     self._disp: display.Display | None = None
     self._root_win = None
+    self._pointer = (0, 0)
+    self._pressed = False
     self.ui_log = ""
     self.replay_log = ""
     self.publish_log = ""
@@ -455,10 +459,41 @@ class UISession:
   def _move(self, x: int, y: int) -> None:
     xtest.fake_input(self._disp, X.MotionNotify, x=x, y=y)
     self._disp.sync()
+    self._pointer = (x, y)
 
   def _btn(self, press: bool) -> None:
     xtest.fake_input(self._disp, X.ButtonPress if press else X.ButtonRelease, 1)
     self._disp.sync()
+    self._pressed = press
+
+  # grabs on its own X connection, xlib connections aren't thread safe. a dot marks the finger while pressed
+  def _record(self, out: Path, stop: threading.Event) -> None:
+    from PIL import ImageDraw
+    disp = display.Display(self.display_name)
+    root = disp.screen().root
+    geo = root.get_geometry()
+    enc = subprocess.Popen([_ff("ffmpeg"), "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{geo.width}x{geo.height}",
+                            "-r", str(RECORD_FPS), "-i", "pipe:0", "-vf", "format=yuv420p", "-c:v", "libx264", "-crf", "20",
+                            "-preset", "veryfast", "-movflags", "+faststart", str(out)], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    r = max(6, geo.height // 24)
+    start, written = time.monotonic(), 0
+    try:
+      while not stop.is_set():
+        raw = root.get_image(0, 0, geo.width, geo.height, X.ZPixmap, 0xffffffff)
+        img = PILImage.frombytes("RGB", (geo.width, geo.height), raw.data, "raw", "BGRX")
+        if self._pressed:
+          x, y = self._pointer
+          ImageDraw.Draw(img).ellipse((x - r, y - r, x + r, y + r), fill=(255, 40, 40))
+        # constant frame rate: repeat the frame for every tick it covers, so the video plays in real time
+        due = int((time.monotonic() - start) * RECORD_FPS) + 1
+        for _ in range(max(due - written, 1 if written == 0 else 0)):
+          enc.stdin.write(img.tobytes())
+          written += 1
+        time.sleep(max(0.0, (written / RECORD_FPS) - (time.monotonic() - start)))
+    finally:
+      enc.stdin.close()
+      enc.wait(timeout=60)
+      disp.close()
 
   def tap(self, x: int, y: int, hold: float = 0.08) -> None:
     if not self.is_running():
@@ -487,7 +522,25 @@ class UISession:
   def hold(self, x: int, y: int, dur: float = 0.8) -> None:
     self.tap(x, y, hold=dur)
 
-  def run_chain(self, script: str) -> tuple[list[str], list[tuple[str, PILImage.Image]]]:
+  def run_chain(self, script: str, record: bool = False) -> tuple[list[str], list[tuple[str, PILImage.Image]], Path | None]:
+    if not record:
+      return (*self._run_steps(script), None)
+    if not self.is_running():
+      raise UISessionError("UI is not running; call start_ui first")
+    CLIP_DIR.mkdir(parents=True, exist_ok=True)
+    out = CLIP_DIR / f"run_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+    stop = threading.Event()
+    rec = threading.Thread(target=self._record, args=(out, stop), daemon=True)
+    rec.start()
+    try:
+      log, shots = self._run_steps(script)
+      time.sleep(0.5)  # let the last screen land in the video
+    finally:
+      stop.set()
+      rec.join(timeout=90)
+    return log, shots, out
+
+  def _run_steps(self, script: str) -> tuple[list[str], list[tuple[str, PILImage.Image]]]:
     import re
     import shlex
     log: list[str] = []
@@ -525,8 +578,22 @@ class UISession:
         raise UISessionError(f"[{i}] unknown step: {op!r}")
     return log, shots
 
+  def get_param(self, name: str):
+    self.ensure_prefix()
+    code = (
+      "import json\n"
+      "from openpilot.common.params import Params\n"
+      f"v = Params().get({name!r})\n"
+      "print(json.dumps(v.decode(errors='replace') if isinstance(v, bytes) else v, default=str))\n"
+    )
+    res = subprocess.run([*self._python(), "-c", code], cwd=str(self.root),
+                         env=self._env(), capture_output=True, text=True, timeout=120)
+    if res.returncode != 0:
+      raise UISessionError(f"get_param failed: {res.stderr.strip() or res.stdout.strip()}")
+    return json.loads(res.stdout.strip().splitlines()[-1])
+
   # returns whether the key feeds the offroad alert list
-  def set_param(self, name: str, value: bool | int | float | str | dict | list) -> bool:
+  def set_param(self, name: str, value: bool | int | float | str | dict | list | None) -> bool:
     self.ensure_prefix()
     # put routes by the value's python type with no coercion, so pass it through as-is.
     # str(v) would break INT/FLOAT params. a bool uses put_bool to be explicit.
@@ -1052,7 +1119,10 @@ mcp = MCPServer(
     "After editing UI code, call restart_ui to reload it (a running replay keeps going). Use start_replay "
     "to feed a route so the onroad UI shows real driving data.\n"
     "Videos: render_clip renders a route offline in seconds, use frames=[...] to see moments without "
-    "opening the mp4. Find moments with logreader's find_windows.\n"
+    "opening the mp4. Find moments with logreader's find_windows. To screen-record an interactive flow "
+    "(taps, typing, settings), use run(script, record=True).\n"
+    "Params: get_param reads, set_param writes (null removes). Fake any message (GPS, carState, ...) "
+    "with publish.\n"
     "Navigation view (arrow + map): render_clip(nav=True) for videos, start_nav before start_replay for "
     "live. Both build the map from the drive's own log, the drive must have been navigating. Maps come from "
     "a tile cache copied off a device to ~/.comma/navigation/tiles (or tiles_dir=), a PC can't use the "
@@ -1062,7 +1132,8 @@ mcp = MCPServer(
     "Comparing UI variants: compare_ref for git refs, or env={...} per render_clip call for variants your "
     "code reads from os.environ.\n"
     "These tools cover the whole loop. Don't write scripts to run mapsd, build map frames, rename route "
-    "folders or switch variants, a tool does each of those."
+    "folders, switch variants, record the screen, or read and write params, a tool does each of those. "
+    "Load all of this server's tools before deciding one is missing."
   ),
 )
 
@@ -1150,8 +1221,11 @@ def hold(x: int, y: int, dur: float = 0.8) -> list:
 
 
 @mcp.tool()
-def run(script: str) -> list:
+def run(script: str, record: bool = False) -> list:
   """Execute a multi-step touch chain in one call and return each captured screenshot.
+
+  record=True also screen-records the whole chain to an mp4 in real time (red dot marks each touch)
+  and returns its path. Use this for a screen recording of any interactive flow, check it with clip_frames.
 
   Steps are separated by ';' or newlines; '#' starts a comment. Coordinates are
   screenshot pixels. Steps:
@@ -1163,8 +1237,10 @@ def run(script: str) -> list:
 
   Example: 'tap 268 120; wait 0.6; capture settings; tap 150 120; wait 0.6; capture toggles'
   """
-  log, shots = SESSION.run_chain(script)
+  log, shots, video = SESSION.run_chain(script, record)
   out: list = ["\n".join(log)]
+  if video is not None:
+    out.append(f"recording: {video}")
   for name, pil in shots:
     out.append(f"--- {name} ---")
     out.append(_img(pil))
@@ -1172,8 +1248,14 @@ def run(script: str) -> list:
 
 
 @mcp.tool()
-def set_param(name: str, value: bool | int | float | str | dict | list, restart: bool = False) -> str:
-  """Write an openpilot Param (e.g. ShowDebugInfo=true for the touch/widget overlay).
+def get_param(name: str) -> str:
+  """Read an openpilot Param from the UI session, as JSON (null when unset)."""
+  return json.dumps(SESSION.get_param(name))
+
+
+@mcp.tool()
+def set_param(name: str, value: bool | int | float | str | dict | list | None, restart: bool = False) -> str:
+  """Write an openpilot Param (e.g. ShowDebugInfo=true for the touch/widget overlay). null removes it.
 
   value type must match the param type (no coercion): bool for BOOL, int for INT,
   float for FLOAT, str for STRING, dict/list for JSON (so pass true/false for a BOOL param, not 1/0).
@@ -1184,7 +1266,7 @@ def set_param(name: str, value: bool | int | float | str | dict | list, restart:
   polled by the UI every 5s, so without a restart this waits that long for them to show.
   """
   alert = SESSION.set_param(name, value)
-  msg = f"set {name}"
+  msg = f"set {name}" if value is not None else f"removed {name}"
   if restart and SESSION.is_running():
     SESSION.restart()
     msg += " (UI restarted)"

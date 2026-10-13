@@ -162,11 +162,13 @@ scaled 1:1, so a point in the screenshot is the point you pass.
 - To catch a transient onroad state (a forced alert, a set-speed flash), use
   `publish(..., background=True)` and `screenshot` while it keeps sending, then
   `stop_publish`. Reaching a specific settings panel is still manual swiping.
+- Screen recording of an interactive flow: `run(script, record=True)` returns an mp4 path,
+  check it with `clip_frames`. Never record the display with ffmpeg yourself.
 
 ## Tools
 
 `start_ui`, `restart_ui`, `stop_ui`, `status`, `screenshot`, `tap`, `swipe`, `hold`,
-`run`, `set_param`, `publish`, `stop_publish`, `go_offroad`, `clear_alerts`,
+`run`, `get_param`, `set_param`, `publish`, `stop_publish`, `go_offroad`, `clear_alerts`,
 `start_replay`, `stop_replay`, `start_nav`, `stop_nav`, `render_clip`, `make_map_frames`,
 `clip_frames`, `ui_diff`, `logs`. Each tool documents its own arguments; read the
 tool descriptions for details.

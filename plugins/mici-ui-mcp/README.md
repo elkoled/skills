@@ -45,8 +45,9 @@ not built. Both the flat layout and the nested one (source under
 | `tap(x, y, hold?)` | tap at screenshot pixels; returns a fresh screenshot |
 | `swipe(x1, y1, x2, y2, dur?)` | stepped swipe (scrolls, not jumps) |
 | `hold(x, y, dur?)` | long-press |
-| `run(script)` | run a multi-step touch chain in one call |
-| `set_param(name, value, restart?)` | write an openpilot Param like `ShowDebugInfo=true`, blocking until it is on disk. value type matches the param (bool/int/float/str, dict/list for JSON). An offroad alert key takes true/false to show/clear it, and waits out the UI's 5s alert refresh |
+| `run(script, record?)` | run a multi-step touch chain in one call. `record=True` also screen-records it to an mp4 in real time, a red dot marks each touch |
+| `get_param(name)` | read an openpilot Param from the UI session as JSON, null when unset |
+| `set_param(name, value, restart?)` | write an openpilot Param like `ShowDebugInfo=true`, blocking until it is on disk. null removes it. value type matches the param (bool/int/float/str, dict/list for JSON). An offroad alert key takes true/false to show/clear it, and waits out the UI's 5s alert refresh |
 | `publish(service, fields, hz?, secs?, background?)` | publish a cereal message (fields by dotted path) so the UI sees data not in a recorded route. `background=True` keeps sending so you can screenshot mid-publish |
 | `stop_publish()` | stop a background publisher |
 | `go_offroad()` | drop the UI to the home page (publishes `deviceState.started=False`) so settings is reachable after a replay |
