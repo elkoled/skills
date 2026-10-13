@@ -6,7 +6,8 @@ description: >-
   inject touch (tap, swipe, long-press) to test a UI change or drive settings/onboarding,
   and replay a route so the onroad UI shows real driving data. Cues like "run the
   openpilot UI", "screenshot the UI", "tap the toggles card", "test my UI change",
-  "what does the settings screen look like", "show the onroad UI for this route". This
+  "what does the settings screen look like", "show the onroad UI for this route",
+  "render this drive", "show the nav / arrow / map view", "compare UI variants". This
   drives a desktop UI on a private headless display, not a physical comma device (for a
   wired comma four use the mici skill instead).
 ---
@@ -36,7 +37,8 @@ screenshot in the tool result, so you see the effect of each action immediately.
 2. Read the screenshot, find the target, then `tap`/`swipe`/`hold` at those pixel
    coordinates. Each returns a fresh screenshot to confirm the result.
 3. For a multi-step flow use `run` with a chain script (one call, all captures returned).
-4. After editing UI code, `restart_ui` to reload it.
+4. After editing UI code, `restart_ui` to reload it. A running replay, background publish and
+   `start_nav` keep running across the restart.
 5. `start_replay` (empty route uses the demo route from 90s, already engaged) to drive the onroad UI with real
    data; `stop_replay` when done. `stop_ui` frees everything.
 
@@ -55,9 +57,9 @@ renders offline with the plugin's `fast_clip.py` (no `start_ui` needed): paralle
 render a slice after a 3s pre-roll, the camera decoded once (NVDEC when there is an NVIDIA GPU), log
 messages parsed only when the UI reads them. 20s of mici UI renders cold in about 1.0-1.3s, the
 output matching a continuous render. `speed=2` makes a 2x video (every frame kept).
-`map_frames=<npz>` (t: modelV2 logMonoTime, maps: mapsd frames) renders the navigation view with
-those maps. `data_dir` renders a local route.
-`root` renders another checkout (e.g. a branch worktree).
+`nav=True` renders the navigation view, see below. `data_dir` renders a local copy of a route.
+`root` renders another checkout (e.g. a branch worktree). `env={...}` sets environment variables in
+the render workers.
 `frames=[...]` (route seconds) returns those frames as one labeled grid instead of the middle frame,
 `crop=[x, y, w, h]` zooms into a region. To check a moment, find it with logreader's `find_windows`
 (e.g. a high steering effort curve, a lane change, an override), then pass its start/end and
@@ -66,6 +68,56 @@ those maps. `data_dir` renders a local route.
 tree below in one stacked mp4. Empty route is the demo route (90s-105s), pass `start`/`end`
 seconds for another range. `overlays=True` adds the time and route text and renders with the
 checkout's slower `tools/clip/run.py`.
+
+## Navigation view (arrow view + map)
+
+The nav view shows when navigation is on and `mapsd` sends map frames. The tools set all of that up
+from the drive's own log, so the drive must have been navigating (its log has `navRoute`).
+
+- Video: `render_clip(route, start, end, nav=True)`. It builds the map frames with
+  `make_map_frames` (cached in `/tmp/op_ui_mcp_maps`, about 25s per 5 min of drive the first time)
+  and renders. To render the same window several times, call `make_map_frames` once and pass its
+  file as `map_frames=`.
+- Live: `start_ui`, then `start_nav`, then `start_replay(route)`. `start_nav` runs the checkout's
+  `mapsd` on the session's msgq and turns navigation on. `stop_nav` turns it off.
+- Map tiles: a PC has no device key for the online tile API, so maps come from a tile cache copied
+  off a device. Copy it once, then every nav call finds it by default:
+  `scp -r comma@<device>:/data/navigation/tiles ~/.comma/navigation/` (or pass `tiles_dir=`).
+  A cache only holds the area that device has driven. A missing tile fails with a clear error.
+- Needs a checkout with `selfdrive/navigation` (pass `root=` for a branch worktree), built with
+  `scons` (the nav params are compiled in, a stale build raises `UnknownKeyName: NavigationEnabled`).
+
+## Local route copies
+
+`data_dir` takes any of these, no renaming needed: a `dongle|route` directory, segment dirs named
+`dongle|route--N`, plain `route--N` dirs (what you get from `scp` off a device's
+`/data/media/0/realdata`, and what `start_replay` caches in `/tmp/op_ui_mcp_routes/<dongle>_<route>`).
+Without `data_dir`, `render_clip` downloads the route from comma, which only works for uploaded drives.
+When copying segments off a device, copy each segment's `rlog.zst` plus `qcamera.ts` (with
+`qcam=True`) or `fcamera.hevc`, and check every segment arrived: a missing rlog fails the render.
+
+## Comparing UI variants
+
+- Two git refs: `render_clip(..., compare_ref="HEAD~1")` stacks that ref above the working tree.
+- More variants in the working tree: have your code read a variable such as
+  `os.getenv("ARROW_STYLE", "1")`, then call `render_clip(..., env={"ARROW_STYLE": "2"}, output=...)`
+  once per variant. Use the same `frames=[...]` on each call to compare the same moments side by side.
+- Find the moments first with logreader's `find_windows` (turns: `abs(modelV2.action.desiredCurvature) > 0.02`,
+  lane changes: `modelV2.meta.laneChangeState == 'laneChangeStarting'`).
+
+## Don't write scripts for these
+
+Every step of the loop has a tool. Reach for it instead of a hand-written script:
+
+| need | tool |
+|------|------|
+| nav view in a video | `render_clip(nav=True)` |
+| map frames npz | `make_map_frames` |
+| live map during a replay | `start_nav` |
+| a local copy with plain `route--N` dirs | `render_clip(data_dir=...)` as is |
+| switch between code variants | `render_clip(env={...})` |
+| see frames of a render | `render_clip(frames=...)` or `clip_frames` |
+| find turns, lane changes, overrides | logreader `find_windows` |
 
 ## UI regression review
 
@@ -115,5 +167,6 @@ scaled 1:1, so a point in the screenshot is the point you pass.
 
 `start_ui`, `restart_ui`, `stop_ui`, `status`, `screenshot`, `tap`, `swipe`, `hold`,
 `run`, `set_param`, `publish`, `stop_publish`, `go_offroad`, `clear_alerts`,
-`start_replay`, `stop_replay`, `render_clip`, `clip_frames`, `ui_diff`, `logs`. Each tool documents its own arguments; read the
+`start_replay`, `stop_replay`, `start_nav`, `stop_nav`, `render_clip`, `make_map_frames`,
+`clip_frames`, `ui_diff`, `logs`. Each tool documents its own arguments; read the
 tool descriptions for details.

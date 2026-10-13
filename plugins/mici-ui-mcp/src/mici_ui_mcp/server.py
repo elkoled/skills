@@ -60,6 +60,13 @@ CLIP_DIR = Path("/tmp/op_ui_mcp_clips")
 CLIP_RUNNER = Path(__file__).resolve().parent / "clip_runner.py"
 FAST_CLIP = Path(__file__).resolve().parent / "fast_clip.py"
 UI_DIFF_RUNNER = Path(__file__).resolve().parent / "ui_diff_runner.py"
+MAP_FRAMES_RUNNER = Path(__file__).resolve().parent / "map_frames_runner.py"
+MAPSD_RUNNER = Path(__file__).resolve().parent / "mapsd_runner.py"
+MAP_DIR = Path("/tmp/op_ui_mcp_maps")
+# where a device keeps its tile cache (/data/navigation/tiles), copied here it serves maps offline
+DEFAULT_TILES = Path.home() / ".comma" / "navigation" / "tiles"
+NAV_DESTINATION = {"latitude": 0.0, "longitude": 0.0}  # the nav view only needs one set, mapsd follows navRoute
+ROUTE_RE = r"([0-9a-f]{16})[/|]([0-9a-f]{8}--[0-9a-f]{10}|\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})"
 UI_DIFF_FPS = 60
 OFFROAD_ALERT_REFRESH = 5.0  # REFRESH_INTERVAL in selfdrive/ui/mici/layouts/offroad_alerts.py
 UI_DIFF_GAP = 30  # changed frames closer than this belong to one screen
@@ -100,6 +107,16 @@ def _is_built(root: Path) -> bool:
   return any(any((root / d).glob("ipc_pyx*.so")) for d in ("msgq_repo/msgq", "msgq"))
 
 
+# an explicit tile cache, else the default one if present, else "" for the online tile API
+def _tiles_dir(tiles_dir: str) -> str:
+  if tiles_dir:
+    p = Path(tiles_dir).expanduser().resolve()
+    if not (p / "version").exists():
+      raise ToolError(f"no tile cache at {p}: copy a device's /data/navigation/tiles there (it has a 'version' file)")
+    return str(p)
+  return str(DEFAULT_TILES) if (DEFAULT_TILES / "version").exists() else ""
+
+
 OPENPILOT_ROOT = _find_openpilot_root()
 
 # replay's TUI fills logs with escape codes. strip CSI seqs and stray controls
@@ -132,6 +149,7 @@ class UISession:
     self._ui: subprocess.Popen | None = None
     self._replay: subprocess.Popen | None = None
     self._publisher: subprocess.Popen | None = None
+    self._mapsd: subprocess.Popen | None = None
     self._render_xvfb: subprocess.Popen | None = None
     self._render_display = ""
     self._render_prefix_ready = False
@@ -140,6 +158,7 @@ class UISession:
     self.ui_log = ""
     self.replay_log = ""
     self.publish_log = ""
+    self.mapsd_log = ""
 
   def is_running(self) -> bool:
     return self._ui is not None and self._ui.poll() is None
@@ -263,8 +282,8 @@ class UISession:
         time.sleep(0.02)
     raise UISessionError(f"X server {name} did not come up: {last}")
 
-  def start(self, mode: str = "small", show_touches: bool = False,
-            show_fps: bool = False, extra_env: dict | None = None, instant_onroad: bool | None = None) -> dict:
+  def start(self, mode: str = "small", show_touches: bool = False, show_fps: bool = False,
+            extra_env: dict | None = None, instant_onroad: bool | None = None, keep_feeds: bool = False) -> dict:
     if mode not in SIZES:
       raise UISessionError(f"unknown mode {mode!r}; use one of {list(SIZES)}")
     if self.is_running():
@@ -273,7 +292,7 @@ class UISession:
       raise UISessionError(f"{self.root} is not an openpilot checkout; pass root= or set OPENPILOT_ROOT")
     if not _is_built(self.root):
       raise UISessionError(f"{self.root} is not built (no msgq ipc_pyx); run `scons -j$(nproc)` there or pass root=")
-    self.stop(quiet=True)
+    self.stop(quiet=True, keep_feeds=keep_feeds)
     self.ensure_prefix()
 
     self.mode = mode
@@ -327,6 +346,11 @@ class UISession:
       status["hint"] = f"UI did not render in {UI_READY_TIMEOUT}s; check logs via the 'logs' tool"
     return status
 
+  # relaunch the UI only, replay, publish and mapsd keep feeding the same msgq
+  def restart(self, mode: str | None = None, show_touches: bool = False, show_fps: bool = False) -> dict:
+    self.stop(quiet=True, keep_feeds=True)
+    return self.start(mode=mode or self.mode, show_touches=show_touches, show_fps=show_fps, keep_feeds=True)
+
   def _wait_until_rendered(self, timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -343,9 +367,12 @@ class UISession:
       time.sleep(0.05)
     return False
 
-  def stop(self, quiet: bool = False) -> dict:
-    self.stop_replay(quiet=True)
-    self.stop_publish(quiet=True)
+  # keep_feeds leaves replay, publish and mapsd running, they share the msgq not the display
+  def stop(self, quiet: bool = False, keep_feeds: bool = False) -> dict:
+    if not keep_feeds:
+      self.stop_replay(quiet=True)
+      self.stop_publish(quiet=True)
+      self.stop_mapsd(quiet=True)
     for attr in ("_ui", "_xvfb"):
       proc = getattr(self, attr)
       if proc is not None and proc.poll() is None:
@@ -386,6 +413,7 @@ class UISession:
       "openpilot_prefix": self.prefix,
       "replay_running": self._replay is not None and self._replay.poll() is None,
       "publish_running": self._publisher is not None and self._publisher.poll() is None,
+      "mapsd_running": self._mapsd is not None and self._mapsd.poll() is None,
       "ui_log": self.ui_log or None,
     }
 
@@ -643,7 +671,7 @@ class UISession:
   # and the python downloader (streaming starts in ~0.3s instead of ~1.1s). returns the dir and
   # the first cached segment, or None when the route string isn't a plain dongle/route
   def cache_route(self, route: str, first_seg: int, dcam: bool, ecam: bool) -> Path | None:
-    m = re.fullmatch(r"([0-9a-f]{16})[/|]([0-9a-f]{8}--[0-9a-f]{10}|\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})", route)
+    m = re.fullmatch(ROUTE_RE, route)
     if m is None:
       return None
     self.ensure_prefix()
@@ -678,6 +706,71 @@ class UISession:
         moving_since = None
       prev = cur
     return False
+
+  def start_mapsd(self, tiles_dir: str = "") -> dict:
+    if not self.is_running():
+      raise UISessionError("start the UI before start_nav so they share the same msgq")
+    if not (self.root / self._rel("selfdrive", "navigation", "mapsd.py")).exists():
+      raise UISessionError(f"{self.root} has no selfdrive/navigation/mapsd.py, check out a branch with navigation")
+    tiles = _tiles_dir(tiles_dir)
+    self.stop_mapsd(quiet=True)
+    self.set_param("NavigationEnabled", True)
+    self.set_param("NavDestination", NAV_DESTINATION)
+    self.mapsd_log = f"/tmp/op_ui_mcp_mapsd{self.display_num}.log"
+    with open(self.mapsd_log, "w") as log_f:
+      self._mapsd = subprocess.Popen([*self._python(), str(MAPSD_RUNNER), tiles], cwd=str(self.root), env=self._env(),
+                                     stdout=log_f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    time.sleep(1.0)
+    if self._mapsd.poll() is not None:
+      raise UISessionError(f"mapsd exited: {self._read_log(self.mapsd_log)}")
+    return {"mapsd_started": True, "tiles": tiles or "online (needs a device key, fails on a PC)", "mapsd_log": self.mapsd_log}
+
+  def stop_mapsd(self, quiet: bool = False) -> dict:
+    self._kill_proc("_mapsd")
+    return {} if quiet else {"mapsd_stopped": True}
+
+  # Route(data_dir) wants segment dirs named dongle|route--N. start_replay's cache and a plain copy off a
+  # device use route--N, so link those under the expected names
+  def resolve_data_dir(self, route: str, data_dir: str) -> str:
+    if not data_dir:
+      return ""
+    d = Path(data_dir).expanduser().resolve()
+    m = re.fullmatch(ROUTE_RE, route.rsplit("/", 2)[0] if route.count("/") == 3 else route)
+    if m is None or not d.is_dir():
+      return str(d)
+    if d.name == f"{m.group(1)}|{m.group(2)}":
+      return str(d.parent)
+    plain = [c for c in d.iterdir() if c.is_dir() and re.fullmatch(rf"{re.escape(m.group(2))}--\d+", c.name)]
+    if not plain:
+      return str(d)
+    links = ROUTE_CACHE / f"{m.group(1)}_{m.group(2)}_links"
+    links.mkdir(parents=True, exist_ok=True)
+    for c in plain:
+      link = links / f"{m.group(1)}|{c.name}"
+      if not link.exists():
+        link.symlink_to(c)
+    return str(links)
+
+  def make_map_frames(self, route: str, start: int, end: int, data_dir: str = "", tiles_dir: str = "",
+                      output: str = "", refresh: bool = False) -> dict:
+    m = re.fullmatch(ROUTE_RE, route)
+    if m is None:
+      raise UISessionError(f"route must be dongle/route, got {route!r}")
+    if end <= start:
+      raise UISessionError(f"end ({end}) must be after start ({start})")
+    tiles = _tiles_dir(tiles_dir)
+    out = Path(output).expanduser().resolve() if output else MAP_DIR / f"{m.group(1)}_{m.group(2)}_{start}_{end}.npz"
+    if out.exists() and not refresh:
+      return {"map_frames": str(out), "cached": True}
+    self.ensure_prefix()
+    t0 = time.monotonic()
+    cmd = [*self._python(), str(MAP_FRAMES_RUNNER), f"{m.group(1)}/{m.group(2)}", self.resolve_data_dir(route, data_dir),
+           str(start), str(end), str(out), tiles]
+    res = subprocess.run(cmd, cwd=str(self.root), env=self._env(), capture_output=True, text=True, timeout=3600)
+    if res.returncode != 0 or not out.exists():
+      raise UISessionError(f"map frames failed:\n{_strip_ansi((res.stderr or res.stdout).strip())[-2000:]}")
+    return {"map_frames": str(out), "cached": False, "seconds": round(time.monotonic() - t0, 1),
+            "tiles": tiles or "online", "result": res.stdout.strip().splitlines()[-1]}
 
   def stop_replay(self, quiet: bool = False) -> dict:
     self._kill_proc("_replay")
@@ -732,7 +825,7 @@ class UISession:
   def render_clip(self, route: str = "", start: int | None = None, end: int | None = None,
                   compare_ref: str = "", big: bool = False, qcam: bool = False,
                   overlays: bool = False, output: str = "", speed: float = 1.0,
-                  map_frames: str = "", data_dir: str = "") -> tuple[dict, Path]:
+                  map_frames: str = "", data_dir: str = "", env: dict | None = None) -> tuple[dict, Path]:
     # the text overlays only exist in the checkout's clip tool, everything else renders with fast_clip
     if overlays:
       if speed != 1.0 or map_frames or data_dir:
@@ -756,8 +849,9 @@ class UISession:
     if not self._render_prefix_ready:
       self._setup_prefix(self.render_prefix)
       self._render_prefix_ready = True
-    env = self._env()
-    env.update({"OPENPILOT_PREFIX": self.render_prefix, "DISPLAY": self.render_display()})
+    run_env = self._env()
+    run_env.update({str(k): str(v) for k, v in (env or {}).items()})
+    run_env.update({"OPENPILOT_PREFIX": self.render_prefix, "DISPLAY": self.render_display()})
 
     args = ["--route", route, "--start", str(start), "--end", str(end), "--speed", str(speed)]
     if big:
@@ -767,9 +861,7 @@ class UISession:
     if map_frames:
       args += ["--map", str(Path(map_frames).expanduser().resolve())]
     if data_dir:
-      # the route's own directory works too, the same path logreader takes
-      d = Path(data_dir).expanduser().resolve()
-      args += ["--data-dir", str(d.parent if d.name == route.replace("/", "|") else d)]
+      args += ["--data-dir", self.resolve_data_dir(route, data_dir)]
 
     CLIP_DIR.mkdir(parents=True, exist_ok=True)
     out = Path(output).expanduser().resolve() if output else CLIP_DIR / f"clip_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
@@ -788,7 +880,7 @@ class UISession:
       log = work / f"render{i}.log"
       cmd = [*self._python(), str(FAST_CLIP), *args, "-o", str(dst)] + (["--overlay", overlay] if overlay else [])
       with open(log, "w") as log_f:
-        procs.append((label, dst, log, subprocess.Popen(cmd, cwd=str(self.root), env=env, stdout=log_f, stderr=subprocess.STDOUT,
+        procs.append((label, dst, log, subprocess.Popen(cmd, cwd=str(self.root), env=run_env, stdout=log_f, stderr=subprocess.STDOUT,
                                                         stdin=subprocess.DEVNULL, start_new_session=True)))
     timings = {}
     for label, dst, log, proc in procs:
@@ -957,8 +1049,20 @@ mcp = MCPServer(
     "tap/swipe/hold at those coordinates -> the tool returns a fresh screenshot to confirm.\n"
     "Coordinates are the pixels you see in the screenshot: small UI is 536x240, big UI is "
     "2160x1080, origin top-left. For multi-step flows prefer the 'run' tool (one chain).\n"
-    "After editing UI code, call restart_ui to reload it. Use start_replay to feed a route "
-    "so the onroad UI shows real driving data."
+    "After editing UI code, call restart_ui to reload it (a running replay keeps going). Use start_replay "
+    "to feed a route so the onroad UI shows real driving data.\n"
+    "Videos: render_clip renders a route offline in seconds, use frames=[...] to see moments without "
+    "opening the mp4. Find moments with logreader's find_windows.\n"
+    "Navigation view (arrow + map): render_clip(nav=True) for videos, start_nav before start_replay for "
+    "live. Both build the map from the drive's own log, the drive must have been navigating. Maps come from "
+    "a tile cache copied off a device to ~/.comma/navigation/tiles (or tiles_dir=), a PC can't use the "
+    "online tile API.\n"
+    "Local drive copies: pass the folder as data_dir, any layout (dongle|route, route--N dirs, "
+    "/tmp/op_ui_mcp_routes). Without data_dir, routes download from comma.\n"
+    "Comparing UI variants: compare_ref for git refs, or env={...} per render_clip call for variants your "
+    "code reads from os.environ.\n"
+    "These tools cover the whole loop. Don't write scripts to run mapsd, build map frames, rename route "
+    "folders or switch variants, a tool does each of those."
   ),
 )
 
@@ -986,10 +1090,12 @@ def start_ui(mode: str = "small", show_touches: bool = False, show_fps: bool = F
 
 @mcp.tool()
 def restart_ui(mode: str | None = None, show_touches: bool = False, show_fps: bool = False) -> list:
-  """Stop and relaunch the UI to pick up code changes. Keeps the same mode unless given."""
-  m = mode or SESSION.mode
-  SESSION.stop(quiet=True)
-  status = SESSION.start(mode=m, show_touches=show_touches, show_fps=show_fps)
+  """Stop and relaunch the UI to pick up code changes. Keeps the same mode unless given.
+
+  A running replay, background publish and mapsd (start_nav) keep running, so the relaunched UI
+  picks the drive and the map straight back up.
+  """
+  status = SESSION.restart(mode=mode, show_touches=show_touches, show_fps=show_fps)
   out: list = [f"restarted: {status}"]
   if SESSION.is_running():
     out.append(_img(SESSION.screenshot()))
@@ -1080,8 +1186,7 @@ def set_param(name: str, value: bool | int | float | str | dict | list, restart:
   alert = SESSION.set_param(name, value)
   msg = f"set {name}"
   if restart and SESSION.is_running():
-    SESSION.stop(quiet=True)
-    SESSION.start(mode=SESSION.mode)
+    SESSION.restart()
     msg += " (UI restarted)"
   elif alert and SESSION.is_running():
     time.sleep(OFFROAD_ALERT_REFRESH + 0.5)
@@ -1187,6 +1292,49 @@ def stop_replay() -> str:
   return str(SESSION.stop_replay())
 
 
+@mcp.tool()
+def start_nav(tiles_dir: str = "") -> list:
+  """Show the live navigation view: run the checkout's mapsd on the session's msgq and turn navigation on.
+
+  Use it for live replays (start_replay) of a drive that was navigating (its log has navRoute), so the
+  UI shows the arrow view and the map instead of the camera. For videos use render_clip(nav=True) instead.
+  Order: start_ui, start_nav, start_replay. The UI is relaunched once so it connects to mapsd fresh, and
+  a replay that is already running keeps going.
+  tiles_dir: a tile cache copied off a device (scp the device's /data/navigation/tiles). Defaults to
+  ~/.comma/navigation/tiles when that exists. A PC has no device key for the online tile API, so
+  without a cache the map stays black and the panel lists 'Map frames: no'.
+  Needs a checkout with selfdrive/navigation (pass root= to start_ui for a branch worktree).
+  """
+  status = SESSION.start_mapsd(tiles_dir)
+  SESSION.restart()
+  return [f"nav: {status}", _img(SESSION.screenshot())]
+
+
+@mcp.tool()
+def stop_nav() -> str:
+  """Stop mapsd and turn navigation off, the onroad UI goes back to the camera view."""
+  SESSION.stop_mapsd()
+  SESSION.set_param("NavDestination", None)
+  return "mapsd stopped, navigation off (restart_ui to drop the nav view now)"
+
+
+@mcp.tool()
+def make_map_frames(route: str, start: float, end: float, data_dir: str = "", tiles_dir: str = "",
+                    output: str = "", refresh: bool = False) -> str:
+  """Build the map frames render_clip needs for the nav view, from a navigating drive's log.
+
+  Usually not needed directly: render_clip(nav=True) calls this. Use it to build frames once and pass
+  the file to several render_clip calls, or to check a drive has a route before rendering.
+  Replays the route's GPS and navRoute through the checkout's own mapsd offline (about 25s for 5 min)
+  and writes an npz (t, maps) to /tmp/op_ui_mcp_maps, reused on later calls unless refresh=True.
+  route: dongle/route. start/end: route seconds, same as render_clip.
+  data_dir: local copy of the route (any layout render_clip takes), else rlogs download from comma.
+  tiles_dir: tile cache copied off a device, defaults to ~/.comma/navigation/tiles when present.
+  Fails clearly when the drive has no navRoute (it wasn't navigating) or a tile is missing from the cache.
+  """
+  return str(SESSION.make_map_frames(route, math.floor(start), math.ceil(end), data_dir, tiles_dir, output, refresh))
+
+
 def _frame_hashes(video: Path) -> list[str]:
   res = subprocess.run([_ff("ffmpeg"), "-nostdin", "-v", "error", "-i", str(video), "-map", "0:v:0", "-fps_mode", "passthrough",
                         "-f", "framehash", "-hash", "md5", "-"], capture_output=True, text=True, check=False)
@@ -1275,7 +1423,8 @@ def clip_frames(path: str, times: list[float], crop: list[int] | None = None, co
 def render_clip(route: str = "", start: float | None = None, end: float | None = None, compare_ref: str = "",
                 big: bool = False, qcam: bool = False, overlays: bool = False, output: str = "",
                 speed: float = 1.0, map_frames: str = "", data_dir: str = "", root: str = "",
-                frames: list[float] | None = None, crop: list[int] | None = None, columns: int = 0) -> list:
+                frames: list[float] | None = None, crop: list[int] | None = None, columns: int = 0,
+                nav: bool = False, tiles_dir: str = "", env: dict | None = None) -> list:
   """Render the onroad UI over a route to an mp4, offline, cold in about a second for 20s of mici UI.
 
   Independent of start_ui, no running UI needed. Empty route uses the demo route (90s-105s unless
@@ -1286,9 +1435,15 @@ def render_clip(route: str = "", start: float | None = None, end: float | None =
   working tree on the bottom, stacked into one video. Only python under selfdrive/ui and system/ui is
   swapped, assets and native code come from the working tree.
   big: tici layout instead of mici. qcam: low-res road camera. speed: playback speed of the mp4 (2 = twice
-  as fast, every frame kept). map_frames: npz with t (modelV2 logMonoTime) and maps ((n, 256, 256) uint8
-  mapsd frames), served on VisionIpc 'mapsd' with navigation on, so the nav view renders. data_dir: local
-  route data (dongle|route/<seg>/ or the openpilot segment layout). overlays: time and route metadata text,
+  as fast, every frame kept).
+  nav: render the navigation view (arrow view + map) instead of the camera view. The map frames are built
+  from the drive's own log by make_map_frames (cached), so the drive must have been navigating (navRoute in
+  its log). tiles_dir: tile cache for that, defaults to ~/.comma/navigation/tiles (a device's
+  /data/navigation/tiles copied over). map_frames: a prebuilt npz from make_map_frames, skips building.
+  data_dir: local route data: a dongle|route dir, the openpilot segment layout, or plain <route>--<n> dirs
+  (start_replay's cache in /tmp/op_ui_mcp_routes, or segments copied off a device). Empty downloads from comma.
+  env: extra environment for the render workers, e.g. {"MY_UI_VARIANT": "2"} to compare variants your code
+  reads from os.environ, one render_clip call per variant (compare_ref covers git refs). overlays: time and route metadata text,
   rendered with the checkout's slower tools/clip/run.py. output: mp4 path, default /tmp/op_ui_mcp_clips/.
   root: openpilot checkout to render (for this and later calls), e.g. a branch worktree.
   Fractional start/end (e.g. from logreader's find_windows) widen to whole seconds.
@@ -1300,7 +1455,15 @@ def render_clip(route: str = "", start: float | None = None, end: float | None =
     SESSION.set_root(root)
   start_i = math.floor(start) if start is not None else None
   end_i = math.ceil(end) if end is not None else None
-  result, out = SESSION.render_clip(route, start_i, end_i, compare_ref, big, qcam, overlays, output, speed, map_frames, data_dir)
+  if nav and not map_frames:
+    r, s_i, e_i = route, start_i, end_i
+    if route.count("/") == 3:
+      r, a, b = route.rsplit("/", 2)
+      s_i, e_i = int(a) if s_i is None else s_i, int(b) if e_i is None else e_i
+    if not r or s_i is None or e_i is None:
+      raise UISessionError("nav needs a route with start and end")
+    map_frames = SESSION.make_map_frames(r, s_i, e_i, data_dir, tiles_dir)["map_frames"]
+  result, out = SESSION.render_clip(route, start_i, end_i, compare_ref, big, qcam, overlays, output, speed, map_frames, data_dir, env)
   content: list = [str(result)]
   if frames:
     t0, sp = result.get("start", start_i) or 0, result.get("speed", 1.0) or 1.0

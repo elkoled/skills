@@ -39,7 +39,7 @@ not built. Both the flat layout and the nested one (source under
 | tool | what it does |
 |------|--------------|
 | `start_ui(mode, show_touches, show_fps, root?, instant_onroad?)` | launch the UI (`mode` = `small` 536x240 or `big` 2160x1080), optionally pointing at another checkout via `root`. `instant_onroad` (default on) skips the device's ~2.5s offroad hold before onroad. Returns a screenshot. |
-| `restart_ui(mode?)` | stop and relaunch to pick up code changes |
+| `restart_ui(mode?)` | relaunch the UI to pick up code changes. A running replay, background publish and `start_nav` keep going |
 | `stop_ui()` | tear down UI, replay and the display |
 | `screenshot()` | capture the current screen as a PNG |
 | `tap(x, y, hold?)` | tap at screenshot pixels; returns a fresh screenshot |
@@ -53,8 +53,11 @@ not built. Both the flat layout and the nested one (source under
 | `clear_alerts()` | clear a sticky onroad alert left on screen after a publish |
 | `start_replay(route, dcam?, ecam?, start?, speed?, wait?)` | replay a route (empty = demo route, from 90s where it is engaged) into the running UI. Waits until the onroad camera plays and returns a screenshot. `local` (default on) replays a cached copy of the 3 segments from `start`, ~1.2s to onroad |
 | `stop_replay()` | stop replay |
+| `start_nav(tiles_dir?)` | live navigation view: runs the checkout's `mapsd` on the session's msgq and turns navigation on, then relaunches the UI. Call before `start_replay` of a navigating drive |
+| `stop_nav()` | stop `mapsd` and turn navigation off |
+| `make_map_frames(route, start, end, data_dir?, tiles_dir?, output?, refresh?)` | build the map frames npz `render_clip` needs for the nav view, by replaying the drive's GPS and `navRoute` through the checkout's `mapsd` offline. Cached in `/tmp/op_ui_mcp_maps` |
 | `ui_diff(ref?, big?, max_screens?)` | UI regression review: records openpilot's scripted UI tour (`selfdrive/ui/tests/diff`) with the ref's UI code and the working tree in parallel, compares every frame, returns only changed screens as ref / new / changed-pixels images (~10s) |
-| `render_clip(route?, start?, end?, compare_ref?, big?, qcam?, overlays?, output?, speed?, map_frames?, data_dir?, root?, frames?, crop?, columns?)` | render the onroad UI over a route to an mp4 offline with `fast_clip.py`: 20s of mici UI in about a second, cold. Parallel workers each render a slice after a 3s pre-roll (the UI's longest timers), the camera is decoded once (NVDEC on NVIDIA, else one ffmpeg per GOP), messages are parsed only when the UI reads them, old logs get the checkout's migrations for the clip window. `speed` plays it faster, `map_frames` (npz of mapsd frames) renders the nav view, `data_dir` a local route. `compare_ref` renders that git ref's UI on top and the working tree below. `overlays` uses the checkout's `tools/clip/run.py`. `root` renders another checkout. Returns the path and a middle-frame preview, or with `frames` (route seconds, e.g. logreader `find_windows` peaks) those frames as one labeled grid, cropped to `crop` |
+| `render_clip(route?, start?, end?, compare_ref?, big?, qcam?, overlays?, output?, speed?, nav?, tiles_dir?, map_frames?, data_dir?, env?, root?, frames?, crop?, columns?)` | render the onroad UI over a route to an mp4 offline with `fast_clip.py`: 20s of mici UI in about a second, cold. Parallel workers each render a slice after a 3s pre-roll (the UI's longest timers), the camera is decoded once (NVDEC on NVIDIA, else one ffmpeg per GOP), messages are parsed only when the UI reads them, old logs get the checkout's migrations for the clip window. `speed` plays it faster, `nav=True` renders the nav view (map frames built and cached automatically, or pass a prebuilt `map_frames`), `data_dir` a local route in any layout (`dongle|route`, `route--N` dirs, the replay cache), `env` sets variables in the render workers for comparing code variants. `compare_ref` renders that git ref's UI on top and the working tree below. `overlays` uses the checkout's `tools/clip/run.py`. `root` renders another checkout. Returns the path and a middle-frame preview, or with `frames` (route seconds, e.g. logreader `find_windows` peaks) those frames as one labeled grid, cropped to `crop` |
 | `clip_frames(path, times, crop?, columns?)` | frames of any video at the given seconds as one labeled grid image, optionally cropped |
 | `status()` / `logs(lines?)` | session state / tail the UI log |
 
@@ -82,6 +85,14 @@ Example, open Settings then a toggle panel, capturing each:
 tap 268 120; wait 0.6; capture settings; tap 150 120; wait 0.6; capture toggles
 ```
 
+## Navigation view
+
+`render_clip(nav=True)` (video) and `start_nav` (live) show the arrow view and map from a navigating
+drive's own log. Maps need a tile cache copied off a device, since a PC has no device key for the
+tile API: `scp -r comma@<device>:/data/navigation/tiles ~/.comma/navigation/` once, or pass
+`tiles_dir=`. The checkout needs `selfdrive/navigation` and a fresh `scons` build. See the skill for
+the full workflow and for comparing variants with `env`.
+
 ## Notes
 
 - The home screen is one big button: tapping almost anywhere opens Settings.
@@ -91,4 +102,5 @@ tap 268 120; wait 0.6; capture settings; tap 150 120; wait 0.6; capture toggles
   compiled module (rebuild with `scons`) or `Xvfb` is missing.
 - `restart_ui` reloads Python only. A change to C++, Cython or a param key (like a new key
   in `common/params_keys.h`) needs a `scons` rebuild from the repo root first.
-- One UI runs at a time per server process, and is killed on server exit.
+- One UI runs at a time per server process, and is killed on server exit, with its replay,
+  publisher and `mapsd`.
