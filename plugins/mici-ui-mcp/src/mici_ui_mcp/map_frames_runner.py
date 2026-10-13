@@ -8,7 +8,6 @@ from pathlib import Path
 
 import numpy as np
 
-LEAD_IN = 15  # seconds before START to replay, navd resends navRoute every 10s
 RATE = 2  # every 2nd modelV2 frame, 10 Hz is plenty for a map that moves at driving speed
 
 
@@ -57,7 +56,46 @@ class LogSubMaster:
       self.valid[w] = msg.valid
 
 
+def render_segment(job):
+  """Map frames for one segment, its own MapsD, so segments render in parallel. The previous segment's
+  log only supplies the route and a GPS fix (navd resends navRoute every 10s), nothing is drawn for it."""
+  import signal
+  signal.signal(signal.SIGINT, signal.SIG_IGN)
+  seg, lead_path, path, lo, hi = job
+  from openpilot.tools.lib.logreader import LogReader
+  sm, maps_d = LogSubMaster(), MAPSD.MapsD()
+  if lead_path:
+    for msg in LogReader(lead_path):
+      if msg.which() in ("gpsLocation", "gpsLocationExternal", "navRoute"):
+        sm.feed(msg)
+  t0, ts, frames, n, seen_route = None, [], [], 0, "navRoute" in sm.msgs
+  for msg in LogReader(path, sort_by_time=True):
+    w = msg.which()
+    if w in ("gpsLocation", "gpsLocationExternal", "navRoute"):
+      sm.feed(msg)
+      seen_route |= w == "navRoute"
+    elif w == "modelV2":
+      if t0 is None:  # route seconds count from the segment start, early messages carry no real time
+        t0 = msg.logMonoTime - seg * 60 * 1_000_000_000
+      n += 1
+      # a little wider than asked, segments start a bit before their first modelV2
+      if n % RATE or not lo - 2 <= (msg.logMonoTime - t0) / 1e9 <= hi + 2:
+        continue
+      frame, _ = maps_d.update(sm)
+      sm.updated = dict.fromkeys(sm.updated, False)
+      ts.append(msg.logMonoTime)
+      frames.append(frame)
+  maps_d.close()
+  return seen_route, ts, frames
+
+
+MAPSD = None
+
+
 def main() -> None:
+  global MAPSD
+  import multiprocessing
+  import os
   route_name, data_dir, start, end, out = sys.argv[1], sys.argv[2] or None, int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
   tiles_dir = Path(sys.argv[6]).expanduser() if len(sys.argv) > 6 and sys.argv[6] else None
 
@@ -65,48 +103,31 @@ def main() -> None:
     from openpilot.selfdrive.navigation import mapsd as mapsd_mod
   except ImportError:
     raise SystemExit("this checkout has no openpilot.selfdrive.navigation (mapsd), check out a branch with navigation") from None
-  from openpilot.tools.lib.logreader import LogReader
   from openpilot.tools.lib.route import Route
 
   if tiles_dir is not None:
     offline_tiles(mapsd_mod, tiles_dir)
+  MAPSD = mapsd_mod
 
-  route = Route(route_name, data_dir=data_dir)
-  logs = route.log_paths()
-  first, last = max(0, (start - LEAD_IN) // 60), min(len(logs) - 1, end // 60)
-  paths = [p for p in logs[first:last + 1] if p]
-  if not paths:
-    raise SystemExit(f"no rlogs for segments {first}-{last} of {route_name}")
+  logs = Route(route_name, data_dir=data_dir).log_paths()
+  jobs = [(seg, logs[seg - 1] if seg > 0 else None, logs[seg], start, end)
+          for seg in range(start // 60, min(len(logs) - 1, end // 60) + 1) if logs[seg]]
+  if not jobs:
+    raise SystemExit(f"no rlogs for {start}-{end}s of {route_name}")
 
-  sm, maps_d = LogSubMaster(), mapsd_mod.MapsD()
-  t0, ts, frames, n, seen_route = None, [], [], 0, False
-  for msg in LogReader(paths, sort_by_time=True):
-    w = msg.which()
-    if t0 is None and w == "modelV2":  # some early messages carry no real time
-      t0 = msg.logMonoTime - first * 60 * 1_000_000_000
-    if w in ("gpsLocation", "gpsLocationExternal", "navRoute"):
-      sm.feed(msg)
-      seen_route |= w == "navRoute"
-    elif w == "modelV2":
-      n += 1
-      if n % RATE:
-        continue
-      frame, _ = maps_d.update(sm)
-      sm.updated = dict.fromkeys(sm.updated, False)
-      # route seconds from the segment start, a little wider since segments start a bit before modelV2
-      if start - 2 <= (msg.logMonoTime - t0) / 1e9 <= end + 2:
-        ts.append(msg.logMonoTime)
-        frames.append(frame)
-  maps_d.close()
+  with multiprocessing.get_context("fork").Pool(min(len(jobs), os.cpu_count() or 1)) as pool:
+    results = pool.map(render_segment, jobs, chunksize=1)
+  ts = [t for _, seg_ts, _ in results for t in seg_ts]
+  frames = [f for _, _, seg_frames in results for f in seg_frames]
 
-  if not seen_route:
+  if not any(seen for seen, _, _ in results):
     raise SystemExit("the log has no navRoute, the drive was not navigating so there is no route to draw")
   if not frames:
     raise SystemExit(f"no modelV2 frames between {start}s and {end}s")
   maps = np.stack(frames)
   Path(out).parent.mkdir(parents=True, exist_ok=True)
   np.savez(out, t=np.array(ts, dtype=np.uint64), maps=maps)
-  print(f"frames={len(ts)} with_map={int(sum(m.any() for m in maps))}")
+  print(f"frames={len(ts)} with_map={int(sum(m.any() for m in maps))} segments={len(jobs)}")
 
 
 if __name__ == "__main__":

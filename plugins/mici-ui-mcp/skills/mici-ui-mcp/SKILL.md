@@ -75,7 +75,7 @@ The nav view shows when navigation is on and `mapsd` sends map frames. The tools
 from the drive's own log, so the drive must have been navigating (its log has `navRoute`).
 
 - Video: `render_clip(route, start, end, nav=True)`. It builds the map frames with
-  `make_map_frames` (cached in `/tmp/op_ui_mcp_maps`, about 25s per 5 min of drive the first time)
+  `make_map_frames` (cached in `/tmp/op_ui_mcp_maps`, one segment per core, about 7s for a 15 min drive the first time)
   and renders. To render the same window several times, call `make_map_frames` once and pass its
   file as `map_frames=`.
 - Live: `start_ui`, then `start_nav`, then `start_replay(route)`. `start_nav` runs the checkout's

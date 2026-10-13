@@ -1325,7 +1325,7 @@ def make_map_frames(route: str, start: float, end: float, data_dir: str = "", ti
 
   Usually not needed directly: render_clip(nav=True) calls this. Use it to build frames once and pass
   the file to several render_clip calls, or to check a drive has a route before rendering.
-  Replays the route's GPS and navRoute through the checkout's own mapsd offline (about 25s for 5 min)
+  Replays the route's GPS and navRoute through the checkout's own mapsd offline, one segment per core (about 7s for a 15 min drive)
   and writes an npz (t, maps) to /tmp/op_ui_mcp_maps, reused on later calls unless refresh=True.
   route: dongle/route. start/end: route seconds, same as render_clip.
   data_dir: local copy of the route (any layout render_clip takes), else rlogs download from comma.

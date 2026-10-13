@@ -715,6 +715,7 @@ def worker(wid: int, args, plan: dict, part: str, done_fd: int) -> None:
       vipc.create_buffers(stream, 4, w, h)
     vipc.start_listener()
   map_server = None
+  sent_map = [-1, 0]  # map index and frame last sent
   if map_bg is not None:
     map_t, map_frames = map_bg.result()
     map_server = VisionIpcServer("mapsd")
@@ -799,8 +800,11 @@ def worker(wid: int, args, plan: dict, part: str, done_fd: int) -> None:
       if "modelV2" in chunks[k]:
         seg, i = chunks[k]["modelV2"]
         map_idx = int(np.clip(np.searchsorted(map_t, logs[seg][1][2][i]), 0, len(map_t) - 1))
-      # a zero start of frame reads as "no map", so stamp it
-      map_server.send(VisionStreamType.VISION_STREAM_MAP, map_frames[map_idx].tobytes(), frame_id, frame_id + 1, frame_id + 1)
+      # only send a changed map, the UI recolors every frame it receives and maps are 10 Hz to its 20.
+      # resend each second so the UI never counts the map as stale. a zero start of frame reads as "no map"
+      if map_idx != sent_map[0] or frame - sent_map[1] >= FPS:
+        map_server.send(VisionStreamType.VISION_STREAM_MAP, map_frames[map_idx].tobytes(), frame_id, frame_id + 1, frame_id + 1)
+        sent_map[:] = [map_idx, frame]
     ui_state.update()
     rl.begin_texture_mode(target)
     rl.clear_background(rl.BLACK)
