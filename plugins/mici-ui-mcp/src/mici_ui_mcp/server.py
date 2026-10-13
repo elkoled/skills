@@ -829,6 +829,7 @@ class UISession:
     out = Path(output).expanduser().resolve() if output else MAP_DIR / f"{m.group(1)}_{m.group(2)}_{start}_{end}.npz"
     if out.exists() and not refresh:
       return {"map_frames": str(out), "cached": True}
+    out.parent.mkdir(parents=True, exist_ok=True)
     self.ensure_prefix()
     t0 = time.monotonic()
     cmd = [*self._python(), str(MAP_FRAMES_RUNNER), f"{m.group(1)}/{m.group(2)}", self.resolve_data_dir(route, data_dir),
@@ -932,6 +933,7 @@ class UISession:
 
     CLIP_DIR.mkdir(parents=True, exist_ok=True)
     out = Path(output).expanduser().resolve() if output else CLIP_DIR / f"clip_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+    out.parent.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="clip_", dir=CLIP_DIR))
     renders = [("current", "", out if not compare_ref else work / "current.mp4")]
     overlay_modules: list[str] = []
@@ -1002,6 +1004,7 @@ class UISession:
 
     CLIP_DIR.mkdir(parents=True, exist_ok=True)
     out = Path(output).expanduser().resolve() if output else CLIP_DIR / f"clip_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+    out.parent.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="clip_", dir=CLIP_DIR))
 
     # (label, overlay dir, output) per render, all run in parallel through clip_runner.py, which
