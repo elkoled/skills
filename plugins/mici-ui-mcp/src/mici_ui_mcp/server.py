@@ -56,6 +56,7 @@ ROUTE_CACHE_SCRIPT = Path(__file__).resolve().parent / "route_cache.py"
 
 CLIP_DIR = Path("/tmp/op_ui_mcp_clips")
 CLIP_RUNNER = Path(__file__).resolve().parent / "clip_runner.py"
+FAST_CLIP = Path(__file__).resolve().parent / "fast_clip.py"
 UI_DIFF_RUNNER = Path(__file__).resolve().parent / "ui_diff_runner.py"
 UI_DIFF_FPS = 60
 OFFROAD_ALERT_REFRESH = 5.0  # REFRESH_INTERVAL in selfdrive/ui/mici/layouts/offroad_alerts.py
@@ -129,6 +130,9 @@ class UISession:
     self._ui: subprocess.Popen | None = None
     self._replay: subprocess.Popen | None = None
     self._publisher: subprocess.Popen | None = None
+    self._render_xvfb: subprocess.Popen | None = None
+    self._render_display = ""
+    self._render_prefix_ready = False
     self._disp: display.Display | None = None
     self._root_win = None
     self.ui_log = ""
@@ -158,8 +162,12 @@ class UISession:
   def ensure_prefix(self) -> None:
     if self._prefix_ready:
       return
-    os.makedirs(f"/dev/shm/msgq_{self.prefix}", exist_ok=True)
-    home = Path.home() / f".comma{self.prefix}"
+    self._setup_prefix(self.prefix)
+    self._prefix_ready = True
+
+  def _setup_prefix(self, prefix: str) -> None:
+    os.makedirs(f"/dev/shm/msgq_{prefix}", exist_ok=True)
+    home = Path.home() / f".comma{prefix}"
     home.mkdir(exist_ok=True)
     auth = Path.home() / ".comma" / "auth.json"
     if auth.exists() and not (home / "auth.json").exists():
@@ -172,15 +180,39 @@ class UISession:
       "  if os.path.isfile(os.path.join(src, f)):\n"
       "    shutil.copy2(os.path.join(src, f), dst)\n"
     )
-    res = subprocess.run([*self._python(), "-c", code], cwd=str(self.root), env=self._env(), capture_output=True, text=True, timeout=60)
+    env = self._env()
+    env["OPENPILOT_PREFIX"] = prefix
+    res = subprocess.run([*self._python(), "-c", code], cwd=str(self.root), env=env, capture_output=True, text=True, timeout=60)
     if res.returncode != 0:
-      raise UISessionError(f"setting up prefix {self.prefix} failed: {res.stderr.strip()}")
-    self._prefix_ready = True
+      raise UISessionError(f"setting up prefix {prefix} failed: {res.stderr.strip()}")
+
+  # renders get their own prefix, so a clip's navigation params never leak into the live UI
+  @property
+  def render_prefix(self) -> str:
+    return f"{self.prefix}_clip"
+
+  # renders draw offscreen but GLFW still needs an X server: the UI's when it runs, else a small
+  # private one that stays up for later renders
+  def render_display(self) -> str:
+    if self.is_running() and self.display_name:
+      return self.display_name
+    if self._render_xvfb is not None and self._render_xvfb.poll() is None:
+      return self._render_display
+    num = self._free_display(200)
+    self._render_display = f":{num}"
+    with open(f"/tmp/op_ui_mcp_xvfb{num}.log", "w") as xvfb_log:
+      self._render_xvfb = subprocess.Popen(["Xvfb", self._render_display, "-screen", "0", "640x480x24", "-nolisten", "tcp"],
+                                           stdout=xvfb_log, stderr=subprocess.STDOUT, start_new_session=True)
+    self._wait_for_xserver(self._render_display)
+    return self._render_display
 
   def cleanup_prefix(self) -> None:
-    shutil.rmtree(f"/dev/shm/msgq_{self.prefix}", ignore_errors=True)
-    shutil.rmtree(Path.home() / f".comma{self.prefix}", ignore_errors=True)
-    self._prefix_ready = False
+    for prefix in (self.prefix, self.render_prefix):
+      shutil.rmtree(f"/dev/shm/msgq_{prefix}", ignore_errors=True)
+      shutil.rmtree(Path.home() / f".comma{prefix}", ignore_errors=True)
+    self._prefix_ready = self._render_prefix_ready = False
+    if self._render_xvfb is not None and self._render_xvfb.poll() is None:
+      os.killpg(os.getpgid(self._render_xvfb.pid), signal.SIGTERM)
 
   def _rel(self, *parts: str) -> str:
     return str(Path(self.pkg_prefix, *parts))
@@ -697,7 +729,91 @@ class UISession:
 
   def render_clip(self, route: str = "", start: int | None = None, end: int | None = None,
                   compare_ref: str = "", big: bool = False, qcam: bool = False,
-                  overlays: bool = False, output: str = "") -> tuple[dict, Path]:
+                  overlays: bool = False, output: str = "", speed: float = 1.0,
+                  map_frames: str = "", data_dir: str = "") -> tuple[dict, Path]:
+    # the text overlays only exist in the checkout's clip tool, everything else renders with fast_clip
+    if overlays:
+      if speed != 1.0 or map_frames or data_dir:
+        raise UISessionError("overlays render with the checkout's clip tool, which has no speed, map_frames or data_dir")
+      return self._render_clip_tool(route, start, end, compare_ref, big, qcam, overlays, output)
+    if not _is_built(self.root):
+      raise UISessionError(f"{self.root} is not built (no msgq ipc_pyx); run `scons -j$(nproc)` there")
+    if route.count("/") == 3:
+      route, s, e = route.rsplit("/", 2)
+      start, end = int(s) if start is None else start, int(e) if end is None else end
+    elif not route:
+      route = DEMO_ROUTE
+      start = DEMO_START if start is None else start
+      end = start + 15 if end is None else end
+    if start is None or end is None:
+      raise UISessionError("pass start and end (seconds) with a route, or route as dongle/route/start/end")
+    if end <= start:
+      raise UISessionError(f"end ({end}) must be after start ({start})")
+    if map_frames and not Path(map_frames).expanduser().exists():
+      raise UISessionError(f"no map frames at {map_frames}")
+    if not self._render_prefix_ready:
+      self._setup_prefix(self.render_prefix)
+      self._render_prefix_ready = True
+    env = self._env()
+    env.update({"OPENPILOT_PREFIX": self.render_prefix, "DISPLAY": self.render_display()})
+
+    args = ["--route", route, "--start", str(start), "--end", str(end), "--speed", str(speed)]
+    if big:
+      args.append("--big")
+    if qcam:
+      args.append("--qcam")
+    if map_frames:
+      args += ["--map", str(Path(map_frames).expanduser().resolve())]
+    if data_dir:
+      args += ["--data-dir", str(Path(data_dir).expanduser().resolve())]
+
+    CLIP_DIR.mkdir(parents=True, exist_ok=True)
+    out = Path(output).expanduser().resolve() if output else CLIP_DIR / f"clip_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+    work = Path(tempfile.mkdtemp(prefix="clip_", dir=CLIP_DIR))
+    renders = [("current", "", out if not compare_ref else work / "current.mp4")]
+    overlay_modules: list[str] = []
+    if compare_ref:
+      overlay_dir = work / "overlay"
+      overlay_dir.mkdir()
+      overlay_modules = self._ref_overlay(compare_ref, overlay_dir)
+      renders.insert(0, (compare_ref, str(overlay_dir), work / "ref.mp4"))
+
+    t0 = time.monotonic()
+    procs = []
+    for i, (label, overlay, dst) in enumerate(renders):
+      log = work / f"render{i}.log"
+      cmd = [*self._python(), str(FAST_CLIP), *args, "-o", str(dst)] + (["--overlay", overlay] if overlay else [])
+      with open(log, "w") as log_f:
+        procs.append((label, dst, log, subprocess.Popen(cmd, cwd=str(self.root), env=env, stdout=log_f, stderr=subprocess.STDOUT,
+                                                        stdin=subprocess.DEVNULL, start_new_session=True)))
+    timings = {}
+    for label, dst, log, proc in procs:
+      rc = proc.wait()
+      if rc != 0 or not dst.exists() or dst.stat().st_size == 0:
+        raise UISessionError(f"render of {label} failed (code {rc}):\n{self._read_log(str(log), 15)}")
+      timings[label] = next((line.strip() for line in open(log) if line.startswith("rendered")), "")
+
+    if compare_ref:
+      res = subprocess.run([_ff("ffmpeg"), "-y", "-v", "error", "-i", str(renders[0][2]), "-i", str(renders[1][2]), "-filter_complex",
+                            "[0:v]pad=w=iw:h=ih+4:x=0:y=0:color=white[top];[top][1:v]vstack=inputs=2:shortest=1",
+                            "-c:v", "libx264", "-crf", "20", "-preset", "veryfast", "-an", str(out)], capture_output=True, text=True)
+      if res.returncode != 0:
+        raise UISessionError(f"stacking failed: {res.stderr.strip()}")
+
+    result = {
+      "output": str(out),
+      "seconds": round(time.monotonic() - t0, 2),
+      "layout": f"top={compare_ref}, bottom=working tree" if compare_ref else "working tree",
+      "render": timings,
+      "work_dir": str(work),
+    }
+    if compare_ref:
+      result["ref_modules"] = overlay_modules
+    return result, out
+
+  def _render_clip_tool(self, route: str = "", start: int | None = None, end: int | None = None,
+                        compare_ref: str = "", big: bool = False, qcam: bool = False,
+                        overlays: bool = False, output: str = "") -> tuple[dict, Path]:
     clip_script = self.root / self._rel("tools", "clip", "run.py")
     if not clip_script.exists():
       raise UISessionError(f"no clip tool at {clip_script}")
@@ -1106,20 +1222,25 @@ def _clip_preview(path: Path) -> Image | None:
 
 @mcp.tool()
 def render_clip(route: str = "", start: int | None = None, end: int | None = None, compare_ref: str = "",
-                big: bool = False, qcam: bool = False, overlays: bool = False, output: str = "") -> list:
-  """Render the onroad UI over a route to an mp4, offline and faster than realtime (tools/clip/run.py).
+                big: bool = False, qcam: bool = False, overlays: bool = False, output: str = "",
+                speed: float = 1.0, map_frames: str = "", data_dir: str = "") -> list:
+  """Render the onroad UI over a route to an mp4, offline, cold in about a second for 20s of mici UI.
 
   Independent of start_ui, no running UI needed. Empty route uses the demo route (90s-105s unless
   start/end given). start/end are seconds into the route, required with a route unless it is
-  dongle/route/start/end. An end past the last camera frame still writes the clip (reported in warnings).
+  dongle/route/start/end. Renders run in parallel workers, each after a 3s pre-roll so the UI's timers
+  and fades match a continuous render, with the camera decoded once (NVDEC when available).
   compare_ref: a git ref (e.g. 'master', 'HEAD~1', a sha). Renders that ref's UI code on top and the
-  working tree on the bottom, in parallel, stacked into one video. Only python under selfdrive/ui and
-  system/ui is swapped, assets and native code come from the working tree.
-  big: tici layout instead of mici. qcam: low-res road camera, faster. overlays: time and route
-  metadata text (off by default, UI only). output: mp4 path, default /tmp/op_ui_mcp_clips/.
+  working tree on the bottom, stacked into one video. Only python under selfdrive/ui and system/ui is
+  swapped, assets and native code come from the working tree.
+  big: tici layout instead of mici. qcam: low-res road camera. speed: playback speed of the mp4 (2 = twice
+  as fast, every frame kept). map_frames: npz with t (modelV2 logMonoTime) and maps ((n, 256, 256) uint8
+  mapsd frames), served on VisionIpc 'mapsd' with navigation on, so the nav view renders. data_dir: local
+  route data (dongle|route/<seg>/ or the openpilot segment layout). overlays: time and route metadata text,
+  rendered with the checkout's slower tools/clip/run.py. output: mp4 path, default /tmp/op_ui_mcp_clips/.
   Returns the result paths and a preview of the middle frame.
   """
-  result, out = SESSION.render_clip(route, start, end, compare_ref, big, qcam, overlays, output)
+  result, out = SESSION.render_clip(route, start, end, compare_ref, big, qcam, overlays, output, speed, map_frames, data_dir)
   content: list = [str(result)]
   preview = _clip_preview(out)
   if preview is not None:

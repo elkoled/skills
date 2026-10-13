@@ -51,13 +51,16 @@ seconds to jump into a route and `speed` to play faster.
 ## Videos and before/after comparisons
 
 For a video of the onroad UI, use `render_clip` instead of screenshotting a live replay. It
-renders offline with the checkout's `tools/clip/run.py` (no `start_ui` needed), always through
-the plugin's `clip_runner.py`, which adds streaming decode and a frame clock when the checkout's
-clip tool lacks them. So every render runs about 10x realtime and comes out the same at any
-render speed, on any checkout.
+renders offline with the plugin's `fast_clip.py` (no `start_ui` needed): parallel workers that each
+render a slice after a 3s pre-roll, the camera decoded once (NVDEC when there is an NVIDIA GPU), log
+messages parsed only when the UI reads them. 20s of mici UI renders cold in about 1.0-1.3s, the
+output matching a continuous render. `speed=2` makes a 2x video (every frame kept).
+`map_frames=<npz>` (t: modelV2 logMonoTime, maps: mapsd frames) renders the navigation view with
+those maps. `data_dir` renders a local route.
 `compare_ref="master"` (or any ref) renders that ref's UI python on top and the working
 tree below in one stacked mp4. Empty route is the demo route (90s-105s), pass `start`/`end`
-seconds for another range. Text overlays are off unless `overlays=True`.
+seconds for another range. `overlays=True` adds the time and route text and renders with the
+checkout's slower `tools/clip/run.py`.
 
 ## UI regression review
 
