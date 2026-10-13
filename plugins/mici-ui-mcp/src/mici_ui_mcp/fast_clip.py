@@ -14,6 +14,7 @@
 # --map serves recorded map frames (npz with t: modelV2 logMonoTime, maps: (n, 256, 256) uint8) on
 # VisionIpc 'mapsd' and enables navigation, so the nav view renders like onroad
 import argparse
+import functools
 import json
 import mmap
 import os
@@ -149,15 +150,18 @@ def frame_messages(dat: bytes, disc_offset: int):
   return offs, sizes, monos, discs
 
 
-def chunk_segment(mono):
-  """Message indices per 1/FPS chunk, the same chunking as tools/clip: messages sorted by time, a chunk per
-  occupied 1/FPS interval counted from the first message, empty intervals skipped."""
-  import numpy as np
-  order = np.argsort(mono, kind="stable")
-  if not len(order):
-    return []
-  interval = (mono[order] - mono[order[0]]) // (10**9 // FPS)
-  return np.split(order, np.flatnonzero(np.diff(interval)) + 1)
+# route time is logMonoTime since initData, which every segment repeats with the same time. logreader's
+# times use the same clock, so its find_windows moments land on the same frames here
+FRAME_NS = 10**9 // FPS
+SEGMENT_SLACK = 3 * FPS  # covers a segment's data starting after its 60 s mark
+ENCODE_IDX = ("narrowRoadEncodeIdx", "roadEncodeIdx", "qNarrowRoadEncodeIdx", "qRoadEncodeIdx")
+
+
+def camera_frame(frame: int, offsets: dict) -> int:
+  """The camera frame (segment * SEGMENT_FRAMES + frame in the segment) shown at a route frame. A segment's video
+  starts a little after its 60 s mark on the route clock and drifts, offsets holds where per segment."""
+  seg = max((int(s) for s, o in offsets.items() if int(s) * SEGMENT_FRAMES + o <= frame), default=min(map(int, offsets)))
+  return frame - offsets[str(seg)]
 
 
 # ---- camera -----------------------------------------------------------------------------------
@@ -387,9 +391,12 @@ def with_fresh_listing(fn):
   return run
 
 
-def decode_camera(args, tag: str, paths: list, seg_start: int, seg_end: int, cam_ranges, mode: str) -> dict:
-  scans = {seg: Background(scan_camera, paths[seg], not args.qcam) for seg in range(seg_start, seg_end)}
+def decode_camera(args, tag: str, paths: list, seg_start: int, seg_end: int, cam_ranges, mode: str, offsets: dict | str) -> dict:
+  scans = {seg: Background(scan_camera, paths[seg], not args.qcam) for seg in range(seg_start, seg_end) if paths[seg]}
   scans = {seg: bg.result() for seg, bg in scans.items()}
+  if isinstance(offsets, str):  # the log helper finds them while the files download and scan
+    offsets = wait_json(offsets, timeout=120)
+  cam_ranges = [(camera_frame(a, offsets), camera_frame(b - 1, offsets) + 1) for a, b in cam_ranges]
   w, h = probe_size(paths[seg_start], None if args.qcam else scans[seg_start][1])
   d = start_decode(tag, scans, cam_ranges, not args.qcam, mode)
   d.update(frame_size=w * h * 3 // 2, w=w, h=h, index={str(k): v for k, v in d["index"].items()})
@@ -398,11 +405,13 @@ def decode_camera(args, tag: str, paths: list, seg_start: int, seg_end: int, cam
   return d
 
 
-def road_camera(args, tag: str, seg_start: int, seg_end: int, cam_ranges, mode: str) -> dict:
+def road_camera(args, tag: str, seg_start: int, seg_end: int, cam_ranges, mode: str, offsets_json: str) -> dict:
   route = get_route(args)
-  return decode_camera(args, f"{tag}_road", route.qcamera_paths() if args.qcam else route.camera_paths(), seg_start, seg_end, cam_ranges, mode)
+  paths = route.qcamera_paths() if args.qcam else route.camera_paths()
+  return decode_camera(args, f"{tag}_road", paths, seg_start, seg_end, cam_ranges, mode, offsets_json)
 
 
+@functools.cache
 def migration_table() -> tuple[list[str], dict[str, tuple[list[str], str | None]]]:
   """migrate_all's migrations in order, with their inputs and product, read from the checkout's source so
   modern logs (nothing to migrate) never import it."""
@@ -421,17 +430,29 @@ def migration_table() -> tuple[list[str], dict[str, tuple[list[str], str | None]
   return [], {}
 
 
+def migrations_for(discs, names_by_disc: dict) -> list[str]:
+  """The migrations an old log needs, none for a modern one."""
+  import numpy as np
+  present = {names_by_disc.get(d) for d in np.unique(discs).tolist()}
+  order, table = migration_table()
+  applicable = [m for m in order if not (table[m][1] and table[m][1] in present) and any(i in present for i in table[m][0])]
+  old = any(i.endswith("DEPRECATED") for m in applicable for i in table[m][0]) or any(table[m][1] for m in applicable)
+  return applicable if old else []
+
+
+def import_migration():
+  import openpilot.selfdrive.test.process_replay.migration  # noqa: F401
+
+
 def migrate_window(dat: bytes, arrays, names_by_disc: dict, window_mono: tuple[int, int]):
   """Applies the checkout's log migrations (migrate_all) to the messages in the clip window, for old logs whose
   services were renamed or derived since. Returns dat and the framing arrays, unchanged for modern logs."""
   import numpy as np
   offs, sizes, monos, discs = arrays
-  present = {names_by_disc.get(d) for d in np.unique(discs).tolist()}
-  order, table = migration_table()
-  applicable = [m for m in order if not (table[m][1] and table[m][1] in present) and any(i in present for i in table[m][0])]
-  old = any(i.endswith("DEPRECATED") for m in applicable for i in table[m][0]) or any(table[m][1] for m in applicable)
-  if not old:
+  applicable = migrations_for(discs, names_by_disc)
+  if not applicable:
     return dat, arrays
+  table = migration_table()[1]
 
   from openpilot.cereal import log
   import openpilot.selfdrive.test.process_replay.migration as migration
@@ -459,11 +480,12 @@ def migrate_window(dat: bytes, arrays, names_by_disc: dict, window_mono: tuple[i
     new_rows.append((pos, len(b), msg.logMonoTime, disc_of[msg.which()]))
     extra.append(b)
     pos += len(b)
-  rows = [(int(offs[i]), int(sizes[i]), int(monos[i]), int(discs[i])) for i in range(len(offs)) if i not in deleted and i not in replaced]
-  rows += new_rows
-  rows.sort(key=lambda r: r[2])
-  offs, sizes, monos, discs = (np.array(c, dtype=np.int64) for c in zip(*rows, strict=True))
-  return dat + b"".join(extra), (offs, sizes, monos, discs)
+  keep = np.ones(len(offs), dtype=bool)
+  keep[list(deleted | set(replaced))] = False
+  new = np.array(new_rows, dtype=np.int64).reshape(-1, 4).T
+  offs, sizes, monos, discs = (np.concatenate([a[keep], n]) for a, n in zip((offs, sizes, monos, discs), new, strict=True))
+  order = np.argsort(monos, kind="stable")
+  return dat + b"".join(extra), (offs[order], sizes[order], monos[order], discs[order])
 
 
 def wide_speeds(args) -> tuple[float, float]:
@@ -482,7 +504,7 @@ def wide_speeds(args) -> tuple[float, float]:
   return 5.0, 10.0
 
 
-def read_logs(args, tag: str, seg_start: int, seg_end: int, cam_ranges, window: tuple[int, int], mode: str) -> dict:
+def read_logs(args, tag: str, seg_start: int, seg_end: int, cam_ranges, window: tuple[int, int], mode: str, offsets_json: str) -> dict:
   import numpy as np
   from openpilot.cereal import log
   route = get_route(args)
@@ -492,45 +514,70 @@ def read_logs(args, tag: str, seg_start: int, seg_end: int, cam_ranges, window: 
   names_by_disc = {f.discriminantValue: f.name for f in node.fields}
   result: dict = {"logs": [], "msgs": [], "cameras": {}}
   want_wide = not args.map and not args.qcam and any(route.ecamera_paths()[seg_start:seg_end])
-  state, frame_state, chunk_base = (False, 0.0), [], 0
-  for n, path in enumerate(route.log_paths()[seg_start:seg_end]):
+  segs = []
+  for seg, path in enumerate(route.log_paths()[seg_start:seg_end], start=seg_start):
     if path is None:
-      raise RuntimeError(f"segment {seg_start + n} has no log")
+      raise RuntimeError(f"segment {seg} has no log")
     dat = read_log(path)
-    offs, sizes, monos, discs = (np.array(a, dtype=np.int64) for a in frame_messages(dat, disc_offset))
-    # the window's time range in this segment, for migrating old logs
-    chunks = chunk_segment(monos)
-    in_seg = [c for k, c in enumerate(chunks) if window[0] <= chunk_base + k < window[1]]
-    window_mono = (int(monos[in_seg[0]].min()) - 10**9, int(monos[in_seg[-1]].max()) + 10**9) if in_seg else (0, -1)
+    segs.append((seg, dat, *(np.array(a, dtype=np.int64) for a in frame_messages(dat, disc_offset))))
+    if len(segs) == 1 and migrations_for(segs[0][5], names_by_disc):
+      Background(import_migration)  # an old log, its migrations import while the rest reads
+
+  # the route clock and where each segment's video sits on it
+  t_init, offsets = None, {}
+  for seg, dat, offs, sizes, monos, discs in segs:
+    if t_init is None and (init := np.flatnonzero(discs == disc["initData"])).size:
+      t_init = int(monos[init[0]])
+  if t_init is None:
+    t_init = int(min(monos.min() for *_, monos, _ in segs if monos.size))  # very old logs, no initData
+  for seg, dat, offs, sizes, monos, discs in segs:
+    enc = next((d for name in ENCODE_IDX if (d := disc.get(name)) is not None and (discs == d).any()), None)
+    if enc is not None:
+      i = int(np.flatnonzero(discs == enc)[0])
+      msg = next(iter(log.Event.read_multiple_bytes(dat[offs[i]:offs[i] + sizes[i]])))
+      idx = getattr(msg, msg.which())
+      offsets[str(seg)] = int((monos[i] - t_init) // FRAME_NS) - (seg * SEGMENT_FRAMES + idx.segmentId)
+    else:  # no encode index, the video starts with the segment's first message
+      offsets[str(seg)] = int((monos[discs != disc["initData"]].min() - t_init) // FRAME_NS) - seg * SEGMENT_FRAMES
+  with open(offsets_json + ".tmp", "w") as f:
+    json.dump(offsets, f)
+  os.rename(offsets_json + ".tmp", offsets_json)
+  result["t_init"], result["offsets"] = t_init, offsets
+
+  window_mono = (t_init + window[0] * FRAME_NS - 10**9, t_init + window[1] * FRAME_NS + 10**9)
+  wide_msgs = []
+  for n, (seg, dat, offs, sizes, monos, discs) in enumerate(segs):
     dat, (offs, sizes, monos, discs) = migrate_window(dat, (offs, sizes, monos, discs), names_by_disc, window_mono)
     with open(f"/dev/shm/{tag}_log{n}", "wb") as f:
       f.write(dat)
     np.save(f"/dev/shm/{tag}_msgs{n}.npy", np.stack([offs, sizes, monos, discs]))
     result["logs"].append(f"/dev/shm/{tag}_log{n}")
     result["msgs"].append(f"/dev/shm/{tag}_msgs{n}.npy")
-    chunks = chunk_segment(monos)
     if want_wide:
-      # (experimental mode, vEgo) per frame of the window, for which frames can show the wide camera
-      for c, chunk in enumerate(chunks):
-        exp, v = state
-        for name in ("selfdriveState", "carState"):
-          sel = chunk[discs[chunk] == disc[name]]
-          if len(sel):
-            i = int(sel[-1])
-            msg = getattr(next(iter(log.Event.read_multiple_bytes(dat[offs[i]:offs[i] + sizes[i]]))), name)
-            exp, v = (msg.experimentalMode, v) if name == "selfdriveState" else (exp, msg.vEgo)
-        state = (exp, v)
-        if window[0] <= chunk_base + c < window[1]:
-          frame_state.append(state)
-    chunk_base += len(chunks)
+      for name in ("selfdriveState", "carState"):
+        for i in np.flatnonzero((discs == disc[name]) & (monos < window_mono[1])).tolist():
+          wide_msgs.append((int(monos[i]), name, dat, int(offs[i]), int(sizes[i])))
   if args.verbose:
     print(f"helper logs done @{time.perf_counter() - T_START:.2f}", flush=True)
 
   if want_wide:
-    # the view switches to the wide camera below one speed and back above another, decode a superset
+    # (experimental mode, vEgo) per frame of the window, for which frames can show the wide camera
+    wide_msgs.sort(key=lambda m: m[0])
+    times = np.array([m[0] for m in wide_msgs], dtype=np.int64)
+    exp, v, j, needed = False, 0.0, 0, []
     _, road_min = wide_speeds(args)
-    first = cam_ranges[0][0]
-    needed = [first + f for f, (exp, v) in enumerate(frame_state) if exp and v < road_min]
+    for f in range(*window):
+      end_ns = t_init + (f + 1) * FRAME_NS
+      last = {}
+      while j < len(times) and times[j] < end_ns:
+        last[wide_msgs[j][1]] = wide_msgs[j]
+        j += 1
+      for name, (_, _, dat, off, size) in last.items():
+        msg = getattr(next(iter(log.Event.read_multiple_bytes(dat[off:off + size]))), name)
+        exp, v = (msg.experimentalMode, v) if name == "selfdriveState" else (exp, msg.vEgo)
+      if exp and v < road_min:
+        needed.append(f)
+    # the view switches to the wide camera below one speed and back above another, decode a superset
     if needed:
       margin, spans = FPS, []
       for f in needed:
@@ -539,7 +586,7 @@ def read_logs(args, tag: str, seg_start: int, seg_end: int, cam_ranges, window: 
         else:
           spans.append([f - margin, f + margin + 1])
       ranges = [(max(a, s0), min(b, s1)) for a, b in cam_ranges for s0, s1 in spans if max(a, s0) < min(b, s1)]
-      result["cameras"]["wide"] = decode_camera(args, f"{tag}_wide", route.ecamera_paths(), seg_start, seg_end, ranges, mode)
+      result["cameras"]["wide"] = decode_camera(args, f"{tag}_wide", route.ecamera_paths(), seg_start, seg_end, ranges, mode, offsets)
   return result
 
 
@@ -651,35 +698,43 @@ def worker(wid: int, args, plan: dict, part: str, done_fd: int) -> None:
   from openpilot.cereal import log
   from openpilot.cereal.visionipc import VisionStreamType
   # everything with a socket from here on is this worker's own
-  os.environ["OPENPILOT_PREFIX"] = f"{plan['prefix']}_{wid}"
+  # unique per render too: compare_ref runs two renders at once and their cameras must not cross
+  os.environ["OPENPILOT_PREFIX"] = f"{plan['tag']}_{wid}"
   os.makedirs(f"/dev/shm/msgq_{os.environ['OPENPILOT_PREFIX']}", exist_ok=True)
 
   prep = wait_json(plan["logs_json"])
   cameras = dict(prep["cameras"])
   if plan["road_json"]:
     cameras["road"] = wait_json(plan["road_json"])
-  logs, chunk_index = {}, []
+  logs = {}
   for n, (log_path, msgs_path) in enumerate(zip(prep["logs"], prep["msgs"], strict=True)):
     with open(log_path, "rb") as f:
       dat = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)
-    msgs = np.load(msgs_path)
-    logs[n] = (dat, msgs)
-    chunk_index += [(n, c) for c in chunk_segment(msgs[2])]
-  if plan["chunk_start"] + plan["nframes"] > len(chunk_index):
-    raise RuntimeError(f"the route has {len(chunk_index) // FPS}s of logs in these segments, the clip ends past that")
+    logs[n] = (dat, np.load(msgs_path))
+  offsets = prep["offsets"]
 
   fields = log.Event.schema.node.struct.fields
   names, disc_names = {f.name: f.discriminantValue for f in fields}, {f.discriminantValue: f.name for f in fields}
   # per frame, the last message of each service the UI subscribes to, as (segment, message index).
   # messages are parsed only when the UI reads them, most services are never read on most frames
-  services = {names[s] for s in ui_state.sm.services if s in names}
+  services = np.array([names[s] for s in ui_state.sm.services if s in names])
+  cols = []
+  for n, (_, (_, _, monos, discs)) in logs.items():
+    keep = np.flatnonzero(np.isin(discs, services))
+    cols.append((monos[keep], np.full(len(keep), n), keep, discs[keep]))
+  monos, segs, idxs, discs = (np.concatenate(c) for c in zip(*cols, strict=True))
+  order = np.argsort(monos, kind="stable")
+  msg_frames = (monos[order] - prep["t_init"]) // FRAME_NS
+  if not len(msg_frames) or msg_frames[-1] < plan["route_frame"] + plan["nframes"] - 1:
+    raise RuntimeError(f"the logs in these segments end at {(msg_frames[-1] if len(msg_frames) else 0) / FPS:.0f}s, the clip ends past that")
+  wanted = plan["route_frame"] + np.array(frames)
+  bounds = zip(np.searchsorted(msg_frames, wanted, "left").tolist(), np.searchsorted(msg_frames, wanted, "right").tolist(), strict=True)
+  segs, idxs, discs = segs[order].tolist(), idxs[order].tolist(), discs[order].tolist()
   chunks = []
-  for k in frames:
-    seg, chunk = chunk_index[plan["chunk_start"] + k]
+  for lo, hi in bounds:
     d = {}
-    for i, disc in zip(chunk.tolist(), logs[seg][1][3][chunk].tolist(), strict=True):
-      if disc in services:
-        d[disc] = (seg, i)
+    for j in range(lo, hi):
+      d[discs[j]] = (segs[j], idxs[j])
     chunks.append({disc_names[disc]: v for disc, v in d.items()})
 
   class Raw:
@@ -802,7 +857,7 @@ def worker(wid: int, args, plan: dict, part: str, done_fd: int) -> None:
     clock[0] = CLOCK_START + frame / FPS
     frame_id = frame - plan["min_frame"]  # pre-roll frames before the clip have negative indices
     for stream, (cam, _, _) in cams.items():
-      data = cam.get(plan["camera_start"] + frame)
+      data = cam.get(camera_frame(plan["route_frame"] + frame, offsets))
       if data is not None:
         vipc.send(stream, data, frame_id, int(frame_id * 5e7), int(frame_id * 5e7))
     if map_server is not None:
@@ -847,8 +902,11 @@ def cleanup(paths: list[str], pids: list[int]) -> None:
         os.killpg(pid, signal.SIGKILL)
       except (ProcessLookupError, PermissionError):
         pass
+    import shutil
     for p in paths:
-      if os.path.exists(p):
+      if os.path.isdir(p):
+        shutil.rmtree(p, ignore_errors=True)
+      elif os.path.exists(p):
         os.unlink(p)
     os._exit(0)
 
@@ -872,21 +930,23 @@ def main() -> None:
 
   prefix = os.environ.setdefault("OPENPILOT_PREFIX", "fastclip")
   os.makedirs(f"/dev/shm/msgq_{prefix}", exist_ok=True)
-  seg_start, seg_end = args.start // 60, (args.end - 1) // 60 + 1
+  # a segment's data starts about a second after its 60 s mark on the route clock, so the segment before covers
+  # the first moments after a boundary and the pre-roll
+  seg_start = max(0, args.start * FPS - PREROLL - SEGMENT_SLACK) // SEGMENT_FRAMES
+  seg_end = (args.end * FPS - 1) // SEGMENT_FRAMES + 1
   route = get_route(args)
-  if not args.map and not args.qcam and not all(route.camera_paths()[seg_start:seg_end]):
+  logs = route.log_paths()
+  seg_end = min(seg_end, len(logs))
+  cams = None if args.map else route.qcamera_paths() if args.qcam else route.camera_paths()
+  if cams is not None and not args.qcam and not all(cams[max(seg_start, args.start // 60):seg_end]):
     print("no fcamera for this clip, rendering the qcamera", flush=True)  # fcameras only upload on request
-    args.qcam = True
-  # a clip starting at a segment boundary pre-rolls from the end of the previous segment, when it has the files
-  if seg_start > 0 and (args.start - seg_start * 60) * FPS < PREROLL:
-    cams = route.qcamera_paths() if args.qcam else route.camera_paths()
-    if route.log_paths()[seg_start - 1] is not None and (args.map or cams[seg_start - 1] is not None):
-      seg_start -= 1
+    args.qcam, cams = True, route.qcamera_paths()
+  # the extra segments before the clip only pre-roll, skip them when their files are missing
+  while seg_start < args.start // 60 and (logs[seg_start] is None or (cams is not None and cams[seg_start] is None)):
+    seg_start += 1
   nframes = (args.end - args.start) * FPS
 
-  # worker 0 pre-rolls too, from earlier in the first segment when there is room
-  chunk_start = (args.start - seg_start * 60) * FPS
-  min_frame = -min(chunk_start, PREROLL)
+  min_frame = -min(args.start * FPS, PREROLL)  # pre-roll, none before the route starts
   per_worker = 66 if args.map else 100  # camera clips decode and draw more per frame, fewer workers contend less
   workers = args.workers or max(1, min((os.cpu_count() or 4) // 3, round(nframes / per_worker)))
   bounds = [round(nframes * i / workers) for i in range(workers + 1)]
@@ -898,13 +958,14 @@ def main() -> None:
   mode = args.decode
   if mode == "auto":
     mode = "gpu" if os.path.exists("/dev/nvidiactl") and not args.qcam else "cpu"
-  plan = {"prefix": prefix, "camera_start": args.start * FPS, "chunk_start": chunk_start, "min_frame": min_frame, "slices": slices,
-          "nframes": nframes, "logs_json": f"/dev/shm/{tag}_logs.json", "road_json": None if args.map else f"/dev/shm/{tag}_road.json"}
+  plan = {"tag": tag, "route_frame": args.start * FPS, "min_frame": min_frame, "slices": slices, "nframes": nframes,
+          "logs_json": f"/dev/shm/{tag}_logs.json", "road_json": None if args.map else f"/dev/shm/{tag}_road.json"}
+  offsets_json = f"/dev/shm/{tag}_offsets.json"
   helpers = []
   if plan["road_json"]:
-    helpers.append(run_helper(with_fresh_listing(road_camera), plan["road_json"], args, tag, seg_start, seg_end, cam_ranges, mode))
+    helpers.append(run_helper(with_fresh_listing(road_camera), plan["road_json"], args, tag, seg_start, seg_end, cam_ranges, mode, offsets_json))
   helpers.append(run_helper(with_fresh_listing(read_logs), plan["logs_json"], args, tag, seg_start, seg_end, cam_ranges,
-                            (chunk_start + min_frame, chunk_start + nframes), mode))
+                            (args.start * FPS + min_frame, args.start * FPS + nframes), mode, offsets_json))
 
   # the nav view shows while navigating, with map frames to show; without them it's the camera view
   from openpilot.common.params import Params
@@ -954,7 +1015,7 @@ def main() -> None:
   failed = [wid for wid, r in enumerate(done_r) if os.read(r, 1) != b"1"]
   timer.lap("render")
 
-  owned = [os.path.join("/dev/shm", f) for f in os.listdir("/dev/shm") if f.startswith(tag)]
+  owned = [os.path.join("/dev/shm", f) for f in os.listdir("/dev/shm") if f.startswith((tag, f"msgq_{tag}_"))]
   decoder_pids = []
   for j in (plan["logs_json"], plan["road_json"]):
     if j and os.path.exists(j):

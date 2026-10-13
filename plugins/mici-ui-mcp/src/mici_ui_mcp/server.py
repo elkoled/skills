@@ -64,6 +64,7 @@ UI_DIFF_RUNNER = Path(__file__).resolve().parent / "ui_diff_runner.py"
 MAP_FRAMES_RUNNER = Path(__file__).resolve().parent / "map_frames_runner.py"
 MAPSD_RUNNER = Path(__file__).resolve().parent / "mapsd_runner.py"
 MAP_DIR = Path("/tmp/op_ui_mcp_maps")
+MAP_FORMAT = "c2"  # bumped when frames built by older code no longer line up, c2: the initData route clock
 # where a device keeps its tile cache (/data/navigation/tiles), copied here it serves maps offline
 DEFAULT_TILES = Path.home() / ".comma" / "navigation" / "tiles"
 NAV_DESTINATION = {"latitude": 0.0, "longitude": 0.0}  # the nav view only needs one set, mapsd follows navRoute
@@ -826,7 +827,7 @@ class UISession:
     if end <= start:
       raise UISessionError(f"end ({end}) must be after start ({start})")
     tiles = _tiles_dir(tiles_dir)
-    out = Path(output).expanduser().resolve() if output else MAP_DIR / f"{m.group(1)}_{m.group(2)}_{start}_{end}.npz"
+    out = Path(output).expanduser().resolve() if output else MAP_DIR / f"{m.group(1)}_{m.group(2)}_{start}_{end}_{MAP_FORMAT}.npz"
     if out.exists() and not refresh:
       return {"map_frames": str(out), "cached": True}
     out.parent.mkdir(parents=True, exist_ok=True)

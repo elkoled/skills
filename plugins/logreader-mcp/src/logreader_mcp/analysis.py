@@ -61,7 +61,7 @@ def _scalar_series(rd: RouteData, service: str, field: str,
     v = rd.field(service, field)
   except (AttributeError, KeyError, IndexError):
     return None, None, {"error": f"field '{field}' not in '{service}'", "available": sorted(rd.field_names(service))}
-  t = rd.times(service)
+  t = rd.route_time(rd.times(service))
   if t_start is not None:
     m = t >= t_start
     t, v = t[m], v[m]
@@ -189,7 +189,7 @@ def decode_signal(rd: RouteData, address: int, signal: str, bus: int = 0,
   if isinstance(res, dict):
     return res
   t, v, dbc_name = res
-  td, vd = _downsample(t, v, max_points)
+  td, vd = _downsample(rd.route_time(t), v, max_points)
   return {"dbc": dbc_name, "address": hex(address), "bus": bus, "signal": signal,
           "n": len(v), "returned": len(td), "t": _to_list(td), "v": _to_list(vd)}
 
@@ -220,12 +220,9 @@ def changing_bits(rd: RouteData, address: int, bus: int = 0, stream: str = "can"
 
 def events_timeline(rd: RouteData, max_events: int = 500) -> dict[str, Any]:
   out = []
-  t0 = None
   svc = next((s for s in ("onroadEvents", "onroadEventsDEPRECATED") if s in rd.service_counts), "onroadEvents")
   for msg in rd.msgs(svc):
-    t = msg.logMonoTime / 1e9
-    if t0 is None:
-      t0 = t
+    t = float(rd.route_time(np.array([msg.logMonoTime / 1e9]))[0])
     names = []
     for ev in getattr(msg, svc):
       try:
@@ -233,7 +230,7 @@ def events_timeline(rd: RouteData, max_events: int = 500) -> dict[str, Any]:
       except Exception:
         pass
     if names:
-      out.append({"t": round(t - t0, 3), "events": names})
+      out.append({"t": round(t, 3), "events": names})
   collapsed = []
   for row in out:
     if collapsed and collapsed[-1]["events"] == row["events"]:
@@ -266,15 +263,15 @@ def engagement_summary(rd: RouteData) -> dict[str, Any]:
   diseng_t = t[1:][trans == -1]
   dt = np.diff(t)
   engaged_time = float(np.sum(dt[en[:-1]])) if len(dt) else 0.0
-  t0 = t[0] if len(t) else 0
+  engage_t, diseng_t = rd.route_time(engage_t), rd.route_time(diseng_t)
   return {
     "source": f"{svc}.{field}",
     "total_s": round(float(t[-1] - t[0]), 2) if len(t) else 0,
     "engaged_s": round(engaged_time, 2),
     "n_engagements": int(np.sum(trans == 1)),
     "n_disengagements": int(np.sum(trans == -1)),
-    "engage_times": [round(float(x - t0), 2) for x in engage_t][:200],
-    "disengage_times": [round(float(x - t0), 2) for x in diseng_t][:200],
+    "engage_times": [round(float(x), 2) for x in engage_t][:200],
+    "disengage_times": [round(float(x), 2) for x in diseng_t][:200],
   }
 
 

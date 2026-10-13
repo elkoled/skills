@@ -510,8 +510,12 @@ class RouteData:
     ts = [v["t"] for svc, v in self.index.items() if len(v["t"]) and svc not in HEADER_SERVICES]
     return (float(min(t[0] for t in ts)), float(max(t[-1] for t in ts))) if ts else (0.0, 0.0)
 
-  # seconds since the route started, so a segment range like '/3:5' starts near 180, not 0
+  # seconds since the route started: logMonoTime since initData, which every segment repeats with the route's
+  # start time, so a segment range like '/3:5' starts near 180 and agrees with a full load and mici-ui-mcp's render_clip
   def route_time(self, t: np.ndarray) -> np.ndarray:
+    init = self.times("initData")
+    if len(init):
+      return t - float(init[0])
     m = re.search(r"(?:/|--)(\d+)(?:/|--)[rq]log", self.ids[0].split("?")[0]) if self.ids else None
     return t - self.span()[0] + (60 * int(m.group(1)) if m else 0)
 

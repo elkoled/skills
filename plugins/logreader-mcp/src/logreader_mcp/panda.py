@@ -94,8 +94,13 @@ def _merged(rd: RouteData) -> dict[str, Any]:
   return out
 
 
-def _window(t_start: float | None, t_end: float | None) -> tuple[int, int]:
-  return (int(t_start * 1e9) if t_start is not None else -(1 << 62), int(t_end * 1e9) if t_end is not None else (1 << 62))
+def _window(t_start: float | None, t_end: float | None, rt0: float = 0.0) -> tuple[int, int]:
+  """A route time window as ns relative to the first frame, which sits at route time rt0."""
+  return (int((t_start - rt0) * 1e9) if t_start is not None else -(1 << 62), int((t_end - rt0) * 1e9) if t_end is not None else (1 << 62))
+
+
+def _route_s(rd: RouteData, t_ns: int) -> float:
+  return round(float(rd.route_time(np.array([t_ns / 1e9]))[0]), 3)
 
 
 def replay(rd: RouteData, t_start: float | None = None, t_end: float | None = None) -> dict[str, Any]:
@@ -115,9 +120,8 @@ def replay(rd: RouteData, t_start: float | None = None, t_end: float | None = No
   if not n:
     return {"error": "no can/sendcan frames in route"}
   frames = replay_shim.Frames(ffi, m)
-  t0 = frames.t0
   ok = np.full(n, 2, dtype=np.uint8)  # 2 = not run (rx, or outside the window)
-  frames.run(lib, 0, n, *_window(t_start, t_end), True, ffi.cast("unsigned char *", ffi.from_buffer(ok)))
+  frames.run(lib, 0, n, *_window(t_start, t_end, _route_s(rd, frames.t0)), True, ffi.cast("unsigned char *", ffi.from_buffer(ok)))
 
   ran_tx = (m["kind"] == 1) & (ok != 2)
   blocked_i = np.flatnonzero(ran_tx & (ok == 0))
@@ -130,7 +134,7 @@ def replay(rd: RouteData, t_start: float | None = None, t_end: float | None = No
     if e is None:
       o, ln = int(m["off"][i]), int(m["len"][i])
       e = blocked[(b, a)] = {"bus": b, "address": a, "address_hex": hex(a), "blocked": 0,
-                             "first_t": round((int(m["t"][i]) - t0) / 1e9, 3), "sample_dat": m["buf"][o:o + ln].hex()}
+                             "first_t": _route_s(rd, int(m["t"][i])), "sample_dat": m["buf"][o:o + ln].hex()}
     e["blocked"] += 1
   groups = sorted(blocked.values(), key=lambda g: -g["blocked"])
   for g in groups:
@@ -169,13 +173,12 @@ def blocked_via_echo(rd: RouteData, window_ms: float = 100.0) -> dict[str, Any]:
   miss = np.flatnonzero(near > win)
   blocked: dict[tuple[int, int], dict[str, Any]] = {}
   n_blocked = len(miss)
-  t0 = s.t_ns[0] if len(s) else 0
   for i in miss:
     b, a = int(s.bus[i]), int(s.addr[i])
     e = blocked.get((b, a))
     if e is None:
       e = blocked[(b, a)] = {"bus": b, "address": a, "address_hex": hex(a),
-                             "no_echo": 0, "first_t": round((int(s.t_ns[i]) - t0) / 1e9, 3)}
+                             "no_echo": 0, "first_t": _route_s(rd, int(s.t_ns[i]))}
     e["no_echo"] += 1
   return {"route": rd.identifier, "method": "echo_diff",
           "note": "no_echo strongly implies a panda block; cross-check with panda_replay",
@@ -202,7 +205,7 @@ def root_cause(rd: RouteData, address: int | None = None, bus: int | None = None
     return {"error": "no can/sendcan frames"}
   frames = replay_shim.Frames(trace.ffi, m)
   t0 = frames.t0
-  start_rel, end_rel = _window(t_start, t_end)
+  start_rel, end_rel = _window(t_start, t_end, _route_s(rd, t0))
   no_ok = trace.ffi.new("unsigned char[]", len(m["t"]))  # unused, the C loop runs no tx hook here
   # tx frames that may need a coverage sample. everything between them (rx hooks, timer and tick
   # for every frame) runs in C, other tx frames get timer and tick but no tx hook, as before
@@ -230,7 +233,7 @@ def root_cause(rd: RouteData, address: int | None = None, bus: int | None = None
     dat = m["buf"][o:o + n]
     # tx_hook mutates rate-limit state, so use this call's verdict, never re-call
     allowed, cov = trace.executed_lines(k[1], k[0], dat, lambda a, nb=need_blocked, na=need_allowed: na if a else nb)
-    tsec = round(rel / 1e9, 3)
+    tsec = _route_s(rd, int(m["t"][i]))
     if not allowed and need_blocked:
       blocked_cov[k] = {"t": tsec, "dat": dat.hex(), "cov": cov}
     elif allowed and need_allowed:

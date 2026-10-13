@@ -3,7 +3,7 @@
 # render_clip's map_frames takes: t (modelV2 logMonoTime) and maps ((n, 256, 256) uint8), uncompressed
 # so fast_clip can memory map them. TILES_DIR serves tiles from a cache copied off a device
 import sys
-import time
+import types
 from pathlib import Path
 
 import numpy as np
@@ -49,11 +49,24 @@ class LogSubMaster:
     w = msg.which()
     self.msgs[w] = getattr(msg, w)
     self.updated[w] = True
-    # latest_gps_source wants a fix newer than 2s of wall time, logs replay faster than that
-    self.recv_time[w] = time.monotonic()
+    self.recv_time[w] = msg.logMonoTime / 1e9
     self.logMonoTime[w] = msg.logMonoTime
     if w != "navRoute":
       self.valid[w] = msg.valid
+
+
+def log_messages(path: str, services: tuple[str, ...]):
+  """The messages of these services in time order, parsing only those of a segment's ~85k."""
+  import numpy as np
+  from openpilot.cereal import log
+  from fast_clip import frame_messages, read_log
+  node = log.Event.schema.node.struct
+  wanted = [f.discriminantValue for f in node.fields if f.name in services]
+  dat = read_log(path)
+  offs, sizes, monos, discs = (np.array(a, dtype=np.int64) for a in frame_messages(dat, node.discriminantOffset * 2))
+  sel = np.flatnonzero(np.isin(discs, wanted))
+  for i in sel[np.argsort(monos[sel], kind="stable")].tolist():
+    yield next(iter(log.Event.read_multiple_bytes(dat[offs[i]:offs[i] + sizes[i]])))
 
 
 def render_segment(job):
@@ -62,25 +75,27 @@ def render_segment(job):
   import signal
   signal.signal(signal.SIGINT, signal.SIG_IGN)
   seg, lead_path, path, lo, hi = job
-  from openpilot.tools.lib.logreader import LogReader
   sm, maps_d = LogSubMaster(), MAPSD.MapsD()
+  feeds = ("gpsLocation", "gpsLocationExternal", "navRoute")
   if lead_path:
-    for msg in LogReader(lead_path):
-      if msg.which() in ("gpsLocation", "gpsLocationExternal", "navRoute"):
-        sm.feed(msg)
+    for msg in log_messages(lead_path, feeds):
+      sm.feed(msg)
   t0, ts, frames, n, seen_route = None, [], [], 0, "navRoute" in sm.msgs
-  for msg in LogReader(path, sort_by_time=True):
+  for msg in log_messages(path, (*feeds, "initData", "modelV2")):
     w = msg.which()
-    if w in ("gpsLocation", "gpsLocationExternal", "navRoute"):
+    if w == "initData" and t0 is None:  # route seconds count from initData, the same clock as logreader and fast_clip
+      t0 = msg.logMonoTime
+    elif w in ("gpsLocation", "gpsLocationExternal", "navRoute"):
       sm.feed(msg)
       seen_route |= w == "navRoute"
     elif w == "modelV2":
-      if t0 is None:  # route seconds count from the segment start, early messages carry no real time
+      if t0 is None:  # very old logs without initData
         t0 = msg.logMonoTime - seg * 60 * 1_000_000_000
       n += 1
-      # a little wider than asked, segments start a bit before their first modelV2
-      if n % RATE or not lo - 2 <= (msg.logMonoTime - t0) / 1e9 <= hi + 2:
+      # a little wider than asked, for the render's pre-roll
+      if n % RATE or not lo - 5 <= (msg.logMonoTime - t0) / 1e9 <= hi + 2:
         continue
+      LOG_CLOCK[0] = msg.logMonoTime / 1e9  # mapsd renders at the frame's time, like onroad
       frame, _ = maps_d.update(sm)
       sm.updated = dict.fromkeys(sm.updated, False)
       ts.append(msg.logMonoTime)
@@ -90,6 +105,7 @@ def render_segment(job):
 
 
 MAPSD = None
+LOG_CLOCK = [0.0]
 
 
 def main() -> None:
@@ -103,15 +119,20 @@ def main() -> None:
     from openpilot.selfdrive.navigation import mapsd as mapsd_mod
   except ImportError:
     raise SystemExit("this checkout has no openpilot.selfdrive.navigation (mapsd), check out a branch with navigation") from None
-  from openpilot.tools.lib.route import Route
+  from argparse import Namespace
+  from fast_clip import get_route  # its route listing cache, the API call is most of a cold build otherwise
 
   if tiles_dir is not None:
     offline_tiles(mapsd_mod, tiles_dir)
   MAPSD = mapsd_mod
+  # mapsd and its GPS freshness check read the log's clock, so a frame doesn't depend on how fast this runs
+  clock = types.SimpleNamespace(monotonic=lambda: LOG_CLOCK[0])
+  mapsd_mod.time = clock
+  sys.modules[mapsd_mod.latest_gps_source.__module__].time = clock
 
-  logs = Route(route_name, data_dir=data_dir).log_paths()
+  logs = get_route(Namespace(route=route_name, data_dir=data_dir)).log_paths()
   jobs = [(seg, logs[seg - 1] if seg > 0 else None, logs[seg], start, end)
-          for seg in range(start // 60, min(len(logs) - 1, end // 60) + 1) if logs[seg]]
+          for seg in range(max(0, start - 7) // 60, min(len(logs) - 1, end // 60) + 1) if logs[seg]]
   if not jobs:
     raise SystemExit(f"no rlogs for {start}-{end}s of {route_name}")
 
