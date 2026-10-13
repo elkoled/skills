@@ -57,6 +57,11 @@ messages parsed only when the UI reads them. 20s of mici UI renders cold in abou
 output matching a continuous render. `speed=2` makes a 2x video (every frame kept).
 `map_frames=<npz>` (t: modelV2 logMonoTime, maps: mapsd frames) renders the navigation view with
 those maps. `data_dir` renders a local route.
+`root` renders another checkout (e.g. a branch worktree).
+`frames=[...]` (route seconds) returns those frames as one labeled grid instead of the middle frame,
+`crop=[x, y, w, h]` zooms into a region. To check a moment, find it with logreader's `find_windows`
+(e.g. a high steering effort curve, a lane change, an override), then pass its start/end and
+`t_peak` straight into `render_clip`. `clip_frames(path, times, crop)` does the same for any video.
 `compare_ref="master"` (or any ref) renders that ref's UI python on top and the working
 tree below in one stacked mp4. Empty route is the demo route (90s-105s), pass `start`/`end`
 seconds for another range. `overlays=True` adds the time and route text and renders with the
@@ -110,5 +115,5 @@ scaled 1:1, so a point in the screenshot is the point you pass.
 
 `start_ui`, `restart_ui`, `stop_ui`, `status`, `screenshot`, `tap`, `swipe`, `hold`,
 `run`, `set_param`, `publish`, `stop_publish`, `go_offroad`, `clear_alerts`,
-`start_replay`, `stop_replay`, `render_clip`, `ui_diff`, `logs`. Each tool documents its own arguments; read the
+`start_replay`, `stop_replay`, `render_clip`, `clip_frames`, `ui_diff`, `logs`. Each tool documents its own arguments; read the
 tool descriptions for details.

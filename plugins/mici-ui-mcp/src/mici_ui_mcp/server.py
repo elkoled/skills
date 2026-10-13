@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -32,6 +33,7 @@ from Xlib.ext import xtest
 
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp_types import ToolAnnotations
 
 SIZES = {
   "small": (536, 240),
@@ -765,7 +767,9 @@ class UISession:
     if map_frames:
       args += ["--map", str(Path(map_frames).expanduser().resolve())]
     if data_dir:
-      args += ["--data-dir", str(Path(data_dir).expanduser().resolve())]
+      # the route's own directory works too, the same path logreader takes
+      d = Path(data_dir).expanduser().resolve()
+      args += ["--data-dir", str(d.parent if d.name == route.replace("/", "|") else d)]
 
     CLIP_DIR.mkdir(parents=True, exist_ok=True)
     out = Path(output).expanduser().resolve() if output else CLIP_DIR / f"clip_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
@@ -802,6 +806,7 @@ class UISession:
 
     result = {
       "output": str(out),
+      "start": start, "end": end, "speed": speed,
       "seconds": round(time.monotonic() - t0, 2),
       "layout": f"top={compare_ref}, bottom=working tree" if compare_ref else "working tree",
       "render": timings,
@@ -1220,10 +1225,57 @@ def _clip_preview(path: Path) -> Image | None:
   return Image(data=res.stdout, format="png") if res.returncode == 0 and res.stdout else None
 
 
+# frames of a video at the given seconds, optionally cropped, as one labeled grid image
+def _contact_sheet(video: Path, times: list[float], labels: list[str], crop: list[int] | None, columns: int) -> Image:
+  from concurrent.futures import ThreadPoolExecutor
+  from PIL import ImageDraw
+
+  def grab(t: float) -> PILImage.Image | None:
+    res = subprocess.run([_ff("ffmpeg"), "-nostdin", "-v", "error", "-ss", f"{max(t, 0.0):.3f}", "-i", str(video), "-frames:v", "1",
+                          "-f", "image2pipe", "-c:v", "png", "-"], capture_output=True, check=False)
+    if res.returncode != 0 or not res.stdout:
+      return None
+    im = PILImage.open(io.BytesIO(res.stdout)).convert("RGB")
+    if crop:
+      x, y, w, h = crop
+      im = im.crop((x, y, x + w, y + h))
+    return im
+
+  with ThreadPoolExecutor(min(16, max(1, len(times)))) as ex:
+    ims = list(ex.map(grab, times))
+  pairs = [(im, label) for im, label in zip(ims, labels, strict=True) if im is not None]
+  if not pairs:
+    raise ToolError(f"no frames at {times} in {video}")
+  w, h = max(im.width for im, _ in pairs), max(im.height for im, _ in pairs)
+  cols = max(1, min(columns or len(pairs), len(pairs)))
+  rows = (len(pairs) + cols - 1) // cols
+  gap, bar = 4, 14
+  sheet = PILImage.new("RGB", (cols * w + (cols - 1) * gap, rows * (h + bar) + (rows - 1) * gap), (255, 255, 255))
+  draw = ImageDraw.Draw(sheet)
+  for i, (im, label) in enumerate(pairs):
+    x, y = (i % cols) * (w + gap), (i // cols) * (h + bar + gap)
+    draw.text((x + 2, y + 1), label, fill=(0, 0, 0))
+    sheet.paste(im, (x, y + bar))
+  return _img(sheet)
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True, open_world_hint=False))
+def clip_frames(path: str, times: list[float], crop: list[int] | None = None, columns: int = 0) -> Image:
+  """Frames of any video at the given seconds as one labeled grid image, to check a render without ffmpeg.
+
+  times: seconds into the video. crop: [x, y, w, h] in video pixels, e.g. [0, 0, 180, 240] for the left third
+  of a small UI clip. columns: frames per row, default all in one row."""
+  video = Path(path).expanduser()
+  if not video.exists():
+    raise ToolError(f"no video at {video}")
+  return _contact_sheet(video, times, [f"{t:.2f}s" for t in times], crop, columns)
+
+
 @mcp.tool()
-def render_clip(route: str = "", start: int | None = None, end: int | None = None, compare_ref: str = "",
+def render_clip(route: str = "", start: float | None = None, end: float | None = None, compare_ref: str = "",
                 big: bool = False, qcam: bool = False, overlays: bool = False, output: str = "",
-                speed: float = 1.0, map_frames: str = "", data_dir: str = "") -> list:
+                speed: float = 1.0, map_frames: str = "", data_dir: str = "", root: str = "",
+                frames: list[float] | None = None, crop: list[int] | None = None, columns: int = 0) -> list:
   """Render the onroad UI over a route to an mp4, offline, cold in about a second for 20s of mici UI.
 
   Independent of start_ui, no running UI needed. Empty route uses the demo route (90s-105s unless
@@ -1238,13 +1290,25 @@ def render_clip(route: str = "", start: int | None = None, end: int | None = Non
   mapsd frames), served on VisionIpc 'mapsd' with navigation on, so the nav view renders. data_dir: local
   route data (dongle|route/<seg>/ or the openpilot segment layout). overlays: time and route metadata text,
   rendered with the checkout's slower tools/clip/run.py. output: mp4 path, default /tmp/op_ui_mcp_clips/.
-  Returns the result paths and a preview of the middle frame.
+  root: openpilot checkout to render (for this and later calls), e.g. a branch worktree.
+  Fractional start/end (e.g. from logreader's find_windows) widen to whole seconds.
+  frames: route seconds (e.g. find_windows' t_peak) to return as one labeled grid image instead of the middle
+  frame. crop: [x, y, w, h] for those frames, columns: frames per row.
+  Returns the result paths and the frames.
   """
-  result, out = SESSION.render_clip(route, start, end, compare_ref, big, qcam, overlays, output, speed, map_frames, data_dir)
+  if root:
+    SESSION.set_root(root)
+  start_i = math.floor(start) if start is not None else None
+  end_i = math.ceil(end) if end is not None else None
+  result, out = SESSION.render_clip(route, start_i, end_i, compare_ref, big, qcam, overlays, output, speed, map_frames, data_dir)
   content: list = [str(result)]
-  preview = _clip_preview(out)
-  if preview is not None:
-    content.append(preview)
+  if frames:
+    t0, sp = result.get("start", start_i) or 0, result.get("speed", 1.0) or 1.0
+    content.append(_contact_sheet(out, [(f - t0) / sp for f in frames], [f"{f:.2f}s" for f in frames], crop, columns))
+  else:
+    preview = _clip_preview(out)
+    if preview is not None:
+      content.append(preview)
   return content
 
 
