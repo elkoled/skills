@@ -26,6 +26,10 @@ import time
 T_START = time.perf_counter()
 FPS = 20
 SEGMENT_FRAMES = FPS * 60
+SM_START = 2  # first SubMaster frame count of a worker
+# UI clock at the clip start. Pre-roll frames are negative, and a clock near 0 reads as fresh to timers
+# that start at 0 (the map's reconnect wait, set speed and chestnut fades), like a device that just booted
+CLOCK_START = 10.0
 PREROLL = 3 * FPS  # frames before a worker's slice: the UI's longest timers (set speed, chestnut fade) are 2.5s, then a fade
 F_SETPIPE_SZ = 1031
 
@@ -393,6 +397,9 @@ def decode_camera(args, tag: str, paths: list, seg_start: int, seg_end: int, cam
 
 def road_camera(args, tag: str, seg_start: int, seg_end: int, cam_ranges, mode: str) -> dict:
   route = get_route(args)
+  if not args.qcam and not all(route.camera_paths()[seg_start:seg_end]):
+    # fcameras only upload on request, fall back to the qcamera devices always upload
+    args.qcam, mode = True, "cpu"
   return decode_camera(args, f"{tag}_road", route.qcamera_paths() if args.qcam else route.camera_paths(), seg_start, seg_end, cam_ranges, mode)
 
 
@@ -723,7 +730,7 @@ def worker(wid: int, args, plan: dict, part: str, done_fd: int) -> None:
     map_server.start_listener()
 
   # frame clock: UI timers follow the frame index
-  clock = [pre / FPS]
+  clock = [CLOCK_START + pre / FPS]
   t0 = time.monotonic()
   time.monotonic = lambda: t0 + clock[0]
   rl.get_time = lambda: clock[0]
@@ -751,7 +758,7 @@ def worker(wid: int, args, plan: dict, part: str, done_fd: int) -> None:
   def mock_update(timeout=None):
     t = time.monotonic()
     sm.updated = dict.fromkeys(sm.services, False)
-    k = sm.frame - pre
+    k = sm.frame - SM_START
     if 0 <= k < len(chunks):
       for svc, (seg, i) in chunks[k].items():
         if svc in sm.data:
@@ -759,7 +766,8 @@ def worker(wid: int, args, plan: dict, part: str, done_fd: int) -> None:
           dict.__setitem__(sm.data, svc, Raw(seg, i))
           sm.logMonoTime[svc], sm.recv_time[svc], sm.recv_frame[svc] = int(logs[seg][1][2][i]), t, sm.frame
     sm.frame += 1
-  sm.frame = pre
+  # ui_state treats sm.frame == 1 as startup and replays the onroad transition, so the count never passes 1
+  sm.frame = SM_START
   sm.update = mock_update
   timer.lap("setup")
 
@@ -790,7 +798,8 @@ def worker(wid: int, args, plan: dict, part: str, done_fd: int) -> None:
   for k, frame in enumerate(frames):
     if skip_preroll and frame == first:
       skip_draws(False)
-    clock[0] = frame / FPS
+      sent_map[0] = -1  # resend, a map received in the pre-roll never reached the skipped update_texture
+    clock[0] = CLOCK_START + frame / FPS
     frame_id = frame - plan["min_frame"]  # pre-roll frames before the clip have negative indices
     for stream, (cam, _, _) in cams.items():
       data = cam.get(plan["camera_start"] + frame)
