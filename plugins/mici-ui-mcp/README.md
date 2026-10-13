@@ -87,11 +87,16 @@ tap 268 120; wait 0.6; capture settings; tap 150 120; wait 0.6; capture toggles
 
 ## Navigation view
 
-`render_clip(nav=True)` (video) and `start_nav` (live) show the arrow view and map from a navigating
-drive's own log. Maps need a tile cache copied off a device, since a PC has no device key for the
-tile API: `scp -r comma@<device>:/data/navigation/tiles ~/.comma/navigation/` once, or pass
-`tiles_dir=`. The checkout needs `selfdrive/navigation` and a fresh `scons` build. See the skill for
-the full workflow and for comparing variants with `env`.
+Shows the arrow view and map from a navigating drive's own log. Needs a checkout with
+`selfdrive/navigation`, freshly built with `scons`.
+
+1. Copy the tile cache off a device once (a PC has no key for the tile API):
+   `scp -r comma@<device>:/data/navigation/tiles ~/.comma/navigation/`
+2. Video: `render_clip(route, start, end, nav=True)`. Map frames are built and cached automatically.
+3. Live: `start_ui` → `start_nav` → `start_replay(route)`.
+
+Compare code variants with `render_clip(env={...})`. Find turns or lane changes to look at with
+logreader `find_windows`, then pass them as `frames`.
 
 ## Notes
 
