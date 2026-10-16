@@ -1016,6 +1016,7 @@ def main() -> None:
   timer.lap("render")
 
   owned = [os.path.join("/dev/shm", f) for f in os.listdir("/dev/shm") if f.startswith((tag, f"msgq_{tag}_"))]
+  owned += [os.path.expanduser(f"~/.comma{tag}_{wid}") for wid in range(workers)]  # each worker's Params home
   decoder_pids = []
   for j in (plan["logs_json"], plan["road_json"]):
     if j and os.path.exists(j):

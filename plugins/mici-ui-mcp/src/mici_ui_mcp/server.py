@@ -135,6 +135,21 @@ class UISessionError(ToolError):
   pass
 
 
+# a server or render killed before its cleanup leaves its prefix dirs behind, drop the ones whose owner is gone
+def _sweep_stale_prefixes() -> None:
+  pat = re.compile(r"(?:\.comma|msgq_)?(?:op_ui_mcp_|fastclip)(\d+)")
+  for base, names in ((Path.home(), os.listdir(Path.home())), (Path("/dev/shm"), os.listdir("/dev/shm"))):
+    for name in names:
+      m = pat.match(name)
+      if m is None or Path(f"/proc/{m.group(1)}").exists():
+        continue
+      p = base / name
+      if p.is_dir():
+        shutil.rmtree(p, ignore_errors=True)
+      else:
+        p.unlink(missing_ok=True)
+
+
 class UISession:
   def __init__(self, root: Path):
     self.root = root
@@ -1601,6 +1616,7 @@ def logs(lines: int = 40) -> str:
 def main() -> None:
   import atexit
   import sys
+  _sweep_stale_prefixes()
   atexit.register(lambda: (SESSION.stop(quiet=True), SESSION.cleanup_prefix()))
 
   def _on_signal(*_):
